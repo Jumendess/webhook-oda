@@ -1,0 +1,34 @@
+{
+  "name": "oda-whatsapp",
+  "version": "1.0.0",
+  "description": "ODA WhatsApp Integration",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start:dev": "node_modules/.bin/nodemon --inspect src/server.js",
+    "start": "node src/server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jumendess/webhook_whatsApp_code"
+  },
+  "author": "Julio Mendes",
+  "license": "MIT",
+  "dependencies": {
+    "@google-cloud/storage": "^7.17.1",
+    "@oracle/bots-node-sdk": "^2.6.1",
+    "axios": "^0.26.1",
+    "body-parser": "^1.19.2",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.1",
+    "log4js": "^6.9.1",
+    "mime-to-extensions": "^1.0.2",
+    "mime-types": "^2.1.35",
+    "node-fetch": "^2.6.7",
+    "node-libcurl": "^3.0.0",
+    "underscore": "^1.13.6"
+  },
+  "devDependencies": {
+    "nodemon": "^1.18.9"
+  }
+}
