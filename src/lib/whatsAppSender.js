@@ -113,14 +113,21 @@ class WhatsAppSender {
       const fileExtension = mime.extension(attachment.mime_type) || 'bin';
       const fileName = `whatsapp_${Date.now()}.${fileExtension}`;
 
-      // 3) Upload no Google Cloud Storage
+      // 3) Upload no Google Cloud Storage usando stream
       const bucket = storage.bucket(Config.GCP_BUCKET_NAME);
       const file = bucket.file(fileName);
 
-      await file.save(Buffer.from(fileResponse.data), {
-        metadata: { contentType: attachment.mime_type },
-        resumable: false,
-        validation: false // evita erro de "stream destroyed"
+      await new Promise((resolve, reject) => {
+        const writeStream = file.createWriteStream({
+          metadata: { contentType: attachment.mime_type },
+          resumable: false,
+          validation: false // evita erro de "stream destroyed"
+        });
+
+        writeStream.on('finish', resolve);
+        writeStream.on('error', reject);
+
+        writeStream.end(Buffer.from(fileResponse.data));
       });
 
       // 4) Gera URL temporária de 1h
