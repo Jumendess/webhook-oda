@@ -89,7 +89,7 @@ class WhatsAppSender {
 
   async _downloadAndSaveWhatsAppAttachmentMessage(attachment) {
     try {
-      // Baixa URL do anexo do WhatsApp
+      // 1) Recupera URL da mídia no WhatsApp
       const config = {
         method: "get",
         url: `${this.whatsAppApiUrl}/${this.whatsAppApiVersion}/${attachment.id}`,
@@ -102,7 +102,7 @@ class WhatsAppSender {
         return null;
       }
 
-      // Baixa o arquivo
+      // 2) Faz download da mídia
       const fileResponse = await axios({
         method: "get",
         url: response.data.url,
@@ -113,19 +113,20 @@ class WhatsAppSender {
       const fileExtension = mime.extension(attachment.mime_type) || 'bin';
       const fileName = `whatsapp_${Date.now()}.${fileExtension}`;
 
-      // Upload para o Google Cloud Storage
+      // 3) Upload no Google Cloud Storage
       const bucket = storage.bucket(Config.GCP_BUCKET_NAME);
       const file = bucket.file(fileName);
 
-      await file.save(fileResponse.data, {
+      await file.save(Buffer.from(fileResponse.data), {
         metadata: { contentType: attachment.mime_type },
         resumable: false,
+        validation: false // evita erro de "stream destroyed"
       });
 
-      // Gera URL temporária de acesso (1 hora)
+      // 4) Gera URL temporária de 1h
       const [signedUrl] = await file.getSignedUrl({
         action: 'read',
-        expires: Date.now() + 1000 * 60 * 60 // 1 hora
+        expires: Date.now() + 1000 * 60 * 60
       });
 
       console.log(`Arquivo salvo em: gs://${Config.GCP_BUCKET_NAME}/${fileName}`);
@@ -133,7 +134,7 @@ class WhatsAppSender {
 
       return signedUrl;
     } catch (error) {
-      console.error("Erro ao baixar o anexo:", error);
+      console.error("Erro ao baixar o anexo:", error.response ? error.response.data : error.message);
       return null;
     }
   }
