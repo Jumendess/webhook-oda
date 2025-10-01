@@ -10,9 +10,9 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Jumendess/webhook_whatsApp_code"
+    "url": ""
   },
-  "author": "Julio Mendes",
+  "author": "",
   "license": "MIT",
   "dependencies": {
     "@google-cloud/storage": "^7.17.1",
