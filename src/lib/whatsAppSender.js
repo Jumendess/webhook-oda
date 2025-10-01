@@ -3,7 +3,7 @@ const Config = require('../../config/Config');
 const Emitter = require('events').EventEmitter;
 const log4js = require('log4js');
 const axios = require('axios');
-const mime = require('mime-types'); // para detectar MIME automaticamente
+const mime = require('mime-types'); // detectar MIME automaticamente
 const { Storage } = require('@google-cloud/storage');
 const fs = require('fs');
 const path = require('path');
@@ -11,9 +11,25 @@ const path = require('path');
 let logger = log4js.getLogger('WhatsAppSender');
 logger.level = Config.LOG_LEVEL;
 
-// Inicializa o cliente do Google Cloud Storage usando variáveis de ambiente
+/** Normaliza a private_key (\n -> quebra real) e retorna credenciais */
+function buildGcpCredentials() {
+  if (!process.env.GCP_SERVICE_ACCOUNT_JSON) {
+    throw new Error('GCP_SERVICE_ACCOUNT_JSON não definido.');
+  }
+  const raw = process.env.GCP_SERVICE_ACCOUNT_JSON;
+  const creds = JSON.parse(raw);
+  if (creds.private_key && creds.private_key.includes('\\n')) {
+    creds.private_key = creds.private_key.replace(/\\n/g, '\n');
+  }
+  return creds;
+}
+
+const creds = buildGcpCredentials();
+
+// Inicializa o cliente do Google Cloud Storage com projectId explícito
 const storage = new Storage({
-  credentials: JSON.parse(process.env.GCP_SERVICE_ACCOUNT_JSON)
+  projectId: creds.project_id,
+  credentials: creds,
 });
 
 class WhatsAppSender {
@@ -92,57 +108,72 @@ class WhatsAppSender {
   async _downloadAndSaveWhatsAppAttachmentMessage(attachment) {
     try {
       // 1) Recupera URL da mídia no WhatsApp
-      const config = {
-        method: "get",
-        url: `${this.whatsAppApiUrl}/${this.whatsAppApiVersion}/${attachment.id}`,
-        headers: { Authorization: `Bearer ${this.whatsAppAccessToken}` },
-      };
+      const metaResp = await axios.get(
+        `${this.whatsAppApiUrl}/${this.whatsAppApiVersion}/${attachment.id}`,
+        { headers: { Authorization: `Bearer ${this.whatsAppAccessToken}` } }
+      );
 
-      const response = await axios.request(config);
-      if (!response.data.url) {
-        console.error("URL do anexo não encontrada!");
+      if (!metaResp.data.url) {
+        console.error("URL do anexo não encontrada! Resposta:", metaResp.data);
         return null;
       }
 
       // 2) Faz download da mídia
-      const fileResponse = await axios({
-        method: "get",
-        url: response.data.url,
+      const fileResponse = await axios.get(metaResp.data.url, {
         headers: { Authorization: `Bearer ${this.whatsAppAccessToken}` },
         responseType: "arraybuffer",
       });
 
-      const fileExtension = mime.extension(attachment.mime_type) || 'bin';
+      const mimeType = attachment.mime_type || 'application/octet-stream';
+      const fileExtension = mime.extension(mimeType) || 'bin';
       const fileName = `whatsapp_${Date.now()}.${fileExtension}`;
 
-      // Caminho temporário em /tmp (Render permite)
-      const tempFilePath = path.join("/tmp", fileName);
+      // 3) Salva em /tmp e faz upload para o bucket
+      const tempFilePath = path.join('/tmp', fileName);
       fs.writeFileSync(tempFilePath, Buffer.from(fileResponse.data));
 
-      // 3) Upload no Google Cloud Storage
       const bucket = storage.bucket(Config.GCP_BUCKET_NAME);
       await bucket.upload(tempFilePath, {
         destination: fileName,
         resumable: false,
         validation: false,
-        metadata: { contentType: attachment.mime_type }
+        metadata: { contentType: mimeType }
       });
 
-      // Remove o arquivo temporário
       fs.unlinkSync(tempFilePath);
 
-      // 4) Gera URL temporária de 1h
-      const [signedUrl] = await bucket.file(fileName).getSignedUrl({
-        action: 'read',
-        expires: Date.now() + 1000 * 60 * 60
-      });
+      const file = bucket.file(fileName);
 
-      console.log(`✅ Arquivo salvo em: gs://${Config.GCP_BUCKET_NAME}/${fileName}`);
-      console.log(`📎 URL temporária de acesso (1h): ${signedUrl}`);
+      // 4) Tenta gerar URL assinada (V4)
+      try {
+        const [signedUrl] = await file.getSignedUrl({
+          version: 'v4',
+          action: 'read',
+          expires: Date.now() + 60 * 60 * 1000 // 1h
+        });
+        console.log(`✅ Arquivo salvo em: gs://${Config.GCP_BUCKET_NAME}/${fileName}`);
+        console.log(`📎 URL temporária (1h): ${signedUrl}`);
+        return signedUrl;
+      } catch (signErr) {
+        console.error('Falha ao assinar URL (getSignedUrl). Tentando fallback...', signErr?.message || signErr);
 
-      return signedUrl;
+        // 5) Fallback opcional: tornar o objeto público se habilitado em env
+        if (process.env.GCS_MAKE_PUBLIC_FALLBACK === 'true') {
+          await file.makePublic();
+          const publicUrl = `https://storage.googleapis.com/${Config.GCP_BUCKET_NAME}/${encodeURIComponent(fileName)}`;
+          console.log(`🌐 Fallback público habilitado. URL: ${publicUrl}`);
+          return publicUrl;
+        }
+
+        // Se não puder tornar público, propaga erro
+        throw signErr;
+      }
     } catch (error) {
-      console.error("❌ Erro ao baixar/salvar o anexo:", error.response ? error.response.data : error.message);
+      const friendly =
+        error?.response?.data
+          ? JSON.stringify(error.response.data)
+          : (error?.message || String(error));
+      console.error("❌ Erro ao baixar/salvar o anexo:", friendly);
       return null;
     }
   }
