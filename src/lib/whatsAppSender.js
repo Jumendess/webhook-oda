@@ -5,6 +5,8 @@ const log4js = require('log4js');
 const axios = require('axios');
 const mime = require('mime-types'); // para detectar MIME automaticamente
 const { Storage } = require('@google-cloud/storage');
+const fs = require('fs');
+const path = require('path');
 
 let logger = log4js.getLogger('WhatsAppSender');
 logger.level = Config.LOG_LEVEL;
@@ -113,35 +115,34 @@ class WhatsAppSender {
       const fileExtension = mime.extension(attachment.mime_type) || 'bin';
       const fileName = `whatsapp_${Date.now()}.${fileExtension}`;
 
-      // 3) Upload no Google Cloud Storage usando stream
+      // Caminho temporário em /tmp (Render permite)
+      const tempFilePath = path.join("/tmp", fileName);
+      fs.writeFileSync(tempFilePath, Buffer.from(fileResponse.data));
+
+      // 3) Upload no Google Cloud Storage
       const bucket = storage.bucket(Config.GCP_BUCKET_NAME);
-      const file = bucket.file(fileName);
-
-      await new Promise((resolve, reject) => {
-        const writeStream = file.createWriteStream({
-          metadata: { contentType: attachment.mime_type },
-          resumable: false,
-          validation: false // evita erro de "stream destroyed"
-        });
-
-        writeStream.on('finish', resolve);
-        writeStream.on('error', reject);
-
-        writeStream.end(Buffer.from(fileResponse.data));
+      await bucket.upload(tempFilePath, {
+        destination: fileName,
+        resumable: false,
+        validation: false,
+        metadata: { contentType: attachment.mime_type }
       });
 
+      // Remove o arquivo temporário
+      fs.unlinkSync(tempFilePath);
+
       // 4) Gera URL temporária de 1h
-      const [signedUrl] = await file.getSignedUrl({
+      const [signedUrl] = await bucket.file(fileName).getSignedUrl({
         action: 'read',
         expires: Date.now() + 1000 * 60 * 60
       });
 
-      console.log(`Arquivo salvo em: gs://${Config.GCP_BUCKET_NAME}/${fileName}`);
-      console.log(`URL temporária de acesso (1h): ${signedUrl}`);
+      console.log(`✅ Arquivo salvo em: gs://${Config.GCP_BUCKET_NAME}/${fileName}`);
+      console.log(`📎 URL temporária de acesso (1h): ${signedUrl}`);
 
       return signedUrl;
     } catch (error) {
-      console.error("Erro ao baixar o anexo:", error.response ? error.response.data : error.message);
+      console.error("❌ Erro ao baixar/salvar o anexo:", error.response ? error.response.data : error.message);
       return null;
     }
   }
