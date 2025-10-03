@@ -1,3 +1,4 @@
+// src/lib/whatsApp.js
 const WhatsAppSender = require('./whatsAppSender');
 const _ = require('underscore');
 const { MessageModel } = require('@oracle/bots-node-sdk/lib');
@@ -16,41 +17,36 @@ class WhatsApp {
 
   /**
    * Receives a message from WhatsApp and convert to ODA payload
-   * @returns {object []} array of messages in ODA format.
-   * @param {object} payload - WhatsApp Message Object
+   * @param {object[]} payload - WhatsApp webhook "entry" array
+   * @returns {object[]} array de mensagens no formato do ODA
    */
   async _receive(payload) {
-    let self = this;
-    let response = await self._getWhatsAppMessages(payload);
-    return response;
+    return this._getWhatsAppMessages(payload);
   }
 
   /**
    * Process WhatsApp messages and convert to ODA message format.
-   * @returns {object []} Array of ODA messages.
    * @param {object[]} payload - Whatsapp Messages array to be processed.
+   * @returns {object[]} Array de mensagens do ODA
    */
   async _getWhatsAppMessages(payload) {
-    let self = this;
-    let odaMessages = [];
+    const odaMessages = [];
     const entries = payload;
+
     for (const entry of entries) {
-      const changes = entry.changes;
+      const changes = entry.changes || [];
       for (const change of changes) {
-        if (!change.value.messages) {
-          return;
-        }
+        if (!change.value || !change.value.messages) continue;
+
         logger.info('Message: ', JSON.stringify(change.value.messages));
 
         const messages = change.value.messages;
-        const userId = change.value.contacts[0].wa_id || '';
-        const contactName = change.value.contacts[0].profile.name || '';
+        const userId = (change.value.contacts && change.value.contacts[0]?.wa_id) || '';
+        const contactName = (change.value.contacts && change.value.contacts[0]?.profile?.name) || '';
 
         for (const message of messages) {
-          let odaMessage = await self._processMessage(message, userId, contactName);
-          if (odaMessage) {
-            odaMessages.push(odaMessage);
-          }
+          const odaMessage = await this._processMessage(message, userId, contactName);
+          if (odaMessage) odaMessages.push(odaMessage);
         }
       }
     }
@@ -59,253 +55,179 @@ class WhatsApp {
 
   /**
    * Process WhatsApp message per type and convert to ODA message format.
-   * @returns {object} ODA message.
-   * @param {object} message - Whatsapp Message.
-   * @param {String} userId - Phone number from user.
-   * @param {String} contactName - Name (if exists) from user.
+   * @param {object} message - Whatsapp Message
+   * @param {string} userId
+   * @param {string} contactName
+   * @returns {object|null} ODA message
    */
   async _processMessage(message, userId, contactName) {
-    let self = this;
-    let odaMessage = {};
+    let odaMessage = null;
 
     switch (message.type) {
       case 'text':
-        odaMessage = self._createTextMessage(userId, contactName, message.text.body);
+        odaMessage = this._createTextMessage(userId, contactName, message.text.body);
         break;
 
       case 'interactive':
-        odaMessage = await self._createInteractiveMessage(userId, contactName, message.interactive);
+        odaMessage = await this._createInteractiveMessage(userId, contactName, message.interactive);
         break;
 
       case 'location':
-        odaMessage = self._createLocationMessage(userId, contactName, message.location);
+        odaMessage = this._createLocationMessage(userId, contactName, message.location);
         break;
 
       case 'audio':
-        odaMessage = await self._createAttachmentMessage(userId, contactName, message.audio, message.type);
+        odaMessage = await this._createAttachmentMessage(userId, contactName, message.audio, 'audio');
         break;
 
       case 'image':
-        odaMessage = await self._createAttachmentMessage(userId, contactName, message.image, message.type);
+        odaMessage = await this._createAttachmentMessage(userId, contactName, message.image, 'image');
         break;
 
       case 'video':
-        odaMessage = await self._createAttachmentMessage(userId, contactName, message.video, message.type);
+        odaMessage = await this._createAttachmentMessage(userId, contactName, message.video, 'video');
         break;
 
       case 'document':
-        odaMessage = await self._createAttachmentMessage(userId, contactName, message.document, message.type);
+        odaMessage = await this._createAttachmentMessage(userId, contactName, message.document, 'document');
         break;
 
       default:
-        // Unsupported message type
-        return odaMessage;
+        logger.warn('Unsupported message type:', message.type);
+        break;
     }
+
     return odaMessage;
   }
 
-  /**
-   * Process text message from WhatsApp and convert to ODA message format.
-   * @returns {object} ODA message.
-   * @param {String} userId - Phone number from user.
-   * @param {String} contactName - Name (if exists) from user.
-   * @param {string} body - Whatsapp text message body.
-   */
+  /** --------------------------
+   *    BUILDERS DE MENSAGEM
+   *  -------------------------- */
+
   _createTextMessage(userId, contactName, body) {
     return {
-      userId: userId,
+      userId,
       messagePayload: MessageModel.textConversationMessage(body),
-      profile: {
-        whatsAppNumber: userId,
-        contactName: contactName
-      }
+      profile: { whatsAppNumber: userId, contactName }
     };
   }
 
-  /**
-   * Process interactive message from WhatsApp and convert to ODA message format.
-   * @returns {object} ODA message.
-   * @param {String} userId - Phone number from user.
-   * @param {String} contactName - Name (if exists) from user.
-   * @param {object} interactive - Whatsapp interactive message.
-   */
   async _createInteractiveMessage(userId, contactName, interactive) {
-    let odaMessage = {};
-
     switch (interactive.type) {
       case 'button_reply':
-        odaMessage = {
-          userId: userId,
-          messagePayload: {
-            'type': 'postback',
-            'postback': {
-              'action': interactive.button_reply.id
-            }
-          },
-          profile: {
-            'whatsAppNumber': userId,
-            'contactName': contactName
-          }
+        return {
+          userId,
+          messagePayload: { type: 'postback', postback: { action: interactive.button_reply.id } },
+          profile: { whatsAppNumber: userId, contactName }
         };
-        break;
 
       case 'list_reply':
-        odaMessage = {
-          userId: userId,
-          messagePayload: {
-            'type': 'postback',
-            'postback': {
-              'action': interactive.list_reply.id
-            }
-          },
-          profile: {
-            'whatsAppNumber': userId,
-            'contactName': contactName
-          }
+        return {
+          userId,
+          messagePayload: { type: 'postback', postback: { action: interactive.list_reply.id } },
+          profile: { whatsAppNumber: userId, contactName }
         };
-        break;
 
       default:
-        // Unsupported interactive message type
-        console.error('Unsupported interactive message type:', interactive.type);
-        break;
+        logger.warn('Unsupported interactive type:', interactive.type);
+        return null;
     }
-    return odaMessage;
   }
 
-  /**
-   * Process location message from WhatsApp and convert to ODA message format.
-   * @returns {object} ODA message.
-   * @param {String} userId - Phone number from user.
-   * @param {String} contactName - Name (if exists) from user.
-   * @param {object} location - Whatsapp location.
-   */
   _createLocationMessage(userId, contactName, location) {
     return {
-      userId: userId,
+      userId,
       messagePayload: {
-        'type': 'location',
-        'location': {
-          'latitude': location.latitude,
-          'longitude': location.longitude
-        }
+        type: 'location',
+        location: { latitude: location.latitude, longitude: location.longitude }
       },
-      profile: {
-        'whatsAppNumber': userId,
-        'contactName': contactName
-      }
+      profile: { whatsAppNumber: userId, contactName }
     };
   }
 
   /**
-   * Process attachment message from WhatsApp and convert to ODA ATTACHMENT format.
-   * Anteriormente convertia para texto com URL; agora envia attachment real.
-   * @returns {object|null} ODA message.
-   * @param {String} userId - Phone number from user.
-   * @param {String} contactName - Name (if exists) from user.
-   * @param {object} attachment - Whatsapp attachment message (image|audio|video|document).
-   * @param {String} type - Message type (image|audio|video|document).
+   * Recebe mídia do WhatsApp e envia ao ODA como ATTACHMENT (image/audio/video/file)
+   * Usa o WhatsAppSender para:
+   *  - baixar mídia da Graph API (usando attachment.id)
+   *  - subir no GCS e gerar URL assinada
    */
   async _createAttachmentMessage(userId, contactName, attachment, type) {
-    let self = this;
-
-    // 1) baixa a mídia do WhatsApp e salva no seu bucket (GCP)
-    //    retornando URL assinada temporária (ou pública se fallback ativo)
-    //    (usa implementação existente em whatsAppSender.js)
-    const fileUrl = await self.whatsAppSender._downloadAndSaveWhatsAppAttachmentMessage(attachment);
-
+    const fileUrl = await this.whatsAppSender._downloadAndSaveWhatsAppAttachmentMessage(attachment);
     if (!fileUrl) {
       logger.error('Falha ao obter URL do anexo (download/upload).');
       return null;
     }
 
-    // 2) mapeia tipo do WhatsApp para tipo do attachment do ODA
-    //    (compatível com o que seu conector já trata no envio ODA -> WhatsApp)
     let odaAttachmentType = 'file';
     switch (type) {
-      case 'image': odaAttachmentType = 'image'; break;
-      case 'audio': odaAttachmentType = 'audio'; break;
-      case 'video': odaAttachmentType = 'video'; break;
-      case 'document': odaAttachmentType = 'file'; break;
-      default: odaAttachmentType = 'file';
+      case 'image':    odaAttachmentType = 'image'; break;
+      case 'audio':    odaAttachmentType = 'audio'; break;
+      case 'video':    odaAttachmentType = 'video'; break;
+      case 'document': odaAttachmentType = 'file';  break;
     }
 
-    // 3) monta payload como ATTACHMENT (não texto)
-    const odaMessage = {
-      userId: userId,
+    const title = attachment.caption || attachment.filename || undefined;
+
+    return {
+      userId,
       messagePayload: {
         type: 'attachment',
         attachment: {
-          type: odaAttachmentType,
-          url: fileUrl,
-          // opcional: você pode repassar nome/caption se existirem no payload do WhatsApp
-          title: attachment.caption || attachment.filename || undefined
+          type: odaAttachmentType,   // image | audio | video | file
+          url: fileUrl,              // URL assinada do GCP
+          title                      // opcional
         }
       },
-      profile: {
-        'whatsAppNumber': userId,
-        'contactName': contactName
-      }
+      profile: { whatsAppNumber: userId, contactName }
     };
-
-    return odaMessage;
   }
 
-  /**
-   * Send ODA message to WhatsApp. Converts message from ODA format to WhatsApp message format.
-   * @param {object} payload - ODA Message Payload
-   */
+  /** --------------------------
+   *      ENVIO PARA WHATSAPP
+   *  -------------------------- */
+
   async _send(payload) {
-    let self = this;
     const { userId, messagePayload } = payload;
     const { type, actions, globalActions, headerText, footerText, channelExtensions } = messagePayload;
 
-    let data = {
+    const data = {
       messaging_product: 'whatsapp',
       preview_url: false,
       recipient_type: 'individual',
       to: userId
     };
 
-    // Check the message type and handle accordingly
-    if (self._isTextOrLocationMessageWithoutActions(type, actions, globalActions)) {
-      // Handle text or location message without actions
-      await self._handleTextOrLocationMessageWithoutActions(channelExtensions, messagePayload, data);
-    } else if (self._isTextMessageWithActions(type, actions, globalActions)) {
-      // Handle text message with actions
-      await self._handleTextMessageWithActions(actions, globalActions, headerText, footerText, messagePayload, data);
-    } else if (self._isCardMessage(type, messagePayload.cards)) {
-      // Handle card message
-      await self._handleCardMessage(messagePayload.cards, globalActions, headerText, footerText, data);
-    } else if (self._isAttachmentMessage(type, messagePayload.attachment)) {
-      // Handle attachment message
-      await self._handleAttachmentMessage(messagePayload.attachment, data);
+    if (this._isTextOrLocationMessageWithoutActions(type, actions, globalActions)) {
+      await this._handleTextOrLocationMessageWithoutActions(channelExtensions, messagePayload, data);
+    } else if (this._isTextMessageWithActions(type, actions, globalActions)) {
+      await this._handleTextMessageWithActions(actions, globalActions, headerText, footerText, messagePayload, data);
+    } else if (this._isCardMessage(type, messagePayload.cards)) {
+      await this._handleCardMessage(messagePayload.cards, globalActions, headerText, footerText, data);
+    } else if (this._isAttachmentMessage(type, messagePayload.attachment)) {
+      await this._handleAttachmentMessage(messagePayload.attachment, data);
     } else {
-      // Unsupported message type
       return;
     }
-    self._sendToWhatsApp(data);
+
+    this._sendToWhatsApp(data);
   }
 
   _isTextOrLocationMessageWithoutActions(type, actions, globalActions) {
     return type === 'text' && (!actions || actions.length === 0) && (!globalActions || globalActions.length === 0);
   }
-
   _isTextMessageWithActions(type, actions, globalActions) {
     return type === 'text' && (actions || globalActions);
   }
-
   _isCardMessage(type, cards) {
     return type === 'card' && cards;
   }
-
   _isAttachmentMessage(type, attachment) {
     return type === 'attachment' && attachment;
   }
 
   async _handleTextOrLocationMessageWithoutActions(channelExtensions, messagePayload, data) {
     logger.info('Handle text or location message without actions');
-    if (channelExtensions && channelExtensions.special_field_type && channelExtensions.special_field_type === 'location') {
+    if (channelExtensions && channelExtensions.special_field_type === 'location') {
       const loc = JSON.parse(channelExtensions.location);
       data.type = 'location';
       data.location = {
@@ -326,30 +248,25 @@ class WhatsApp {
     data.interactive = {
       type: 'button',
       body: { text: bodyText },
-      action: {
-        buttons: []
-      }
+      action: { buttons: [] }
     };
 
     actions && actions.forEach(action => {
       data.interactive.action.buttons.push({
         type: 'reply',
-        reply: { id: action.postback.action, title: action.label.length < 21 ? action.label : action.label.substr(0, 16).concat('...') } // max 20 chars
+        reply: {
+          id: action.postback.action,
+          title: action.label.length < 21 ? action.label : action.label.substr(0, 16).concat('...')
+        }
       });
     });
 
     if (image) {
-      data.interactive.header = {
-        type: 'image',
-        image: { link: image }
-      };
+      data.interactive.header = { type: 'image', image: { link: image } };
     } else if (headerText) {
-      data.interactive.header = { 'type': 'text', text: headerText };
+      data.interactive.header = { type: 'text', text: headerText };
     }
-
-    if (footerText) {
-      data.interactive.footer = { text: footerText };
-    }
+    if (footerText) data.interactive.footer = { text: footerText };
   }
 
   async _handlePostbackActionsListItems(actions, headerText, footerText, messagePayload, image, data) {
@@ -358,97 +275,80 @@ class WhatsApp {
     data.interactive = {
       type: 'list',
       body: { text: messagePayload.text },
-      action: { button: "Escolha uma opção", sections: [] } //max 20 chars
+      action: { button: 'Escolha uma opção', sections: [] }
     };
 
-    let rows = [];
+    const rows = [];
     actions && actions.forEach(action => {
-      rows.push({ id: action.postback.action, title: action.label.length < 24 ? action.label : action.label.substr(0, 20).concat('...')}); // max 24 chars
+      rows.push({
+        id: action.postback.action,
+        title: action.label.length < 24 ? action.label : action.label.substr(0, 20).concat('...')
+      });
     });
 
-    let section = { rows: rows };
-    data.interactive.action.sections.push(section);
+    data.interactive.action.sections.push({ rows });
 
     if (image) {
-      data.interactive.header = {
-        type: 'image',
-        image: { link: image }
-      };
+      data.interactive.header = { type: 'image', image: { link: image } };
     } else if (headerText) {
-      data.interactive.header = {
-        'type': 'text',
-        text: headerText
-      };
+      data.interactive.header = { type: 'text', text: headerText };
     }
-
-    if (footerText) {
-      data.interactive.footer = { text: footerText };
-    }
+    if (footerText) data.interactive.footer = { text: footerText };
   }
 
   async _handlePostbackActionsTextItems(actions, headerText, footerText, bodyText, data) {
     logger.info('Handle other actions (url, phone, etc) and ten more items');
-    let self = this;
     let response = '';
-    if (headerText) {
-      response = response.concat(headerText).concat('\n\n');
-    }
+    if (headerText) response = response.concat(headerText).concat('\n\n');
     response = response.concat(bodyText).concat('\n');
-    for (var key in actions) {
+
+    for (const key in actions) {
       actions[key].forEach(action => {
-        let actionAstext = self._createWhatsAppAction(action, data)
-        if (actionAstext) {
-          response = response.concat('\n').concat(actionAstext);
-        }
+        const t = this._createWhatsAppAction(action, data);
+        if (t) response = response.concat('\n').concat(t);
       });
     }
-    if (footerText) {
-      response = response.concat('\n\n').concat(footerText);
-    }
+
+    if (footerText) response = response.concat('\n\n').concat(footerText);
+    data.type = 'text';
     data.text = { body: response };
   }
 
   _createWhatsAppAction(odaAction, data) {
-    let { type, label, url, phoneNumber } = odaAction;
+    const { type, label, url, phoneNumber } = odaAction;
+    if (type === 'share') return;
 
-    if (type == 'share') {
-      return;
-    }
     let result = label ? label : '';
     switch (type) {
-      case 'url': {
+      case 'url':
         data.preview_url = true;
-        result = result.concat(": ").concat(url);
+        result = result.concat(': ').concat(url);
         break;
-      }
-      case 'call': {
-        result = result.concat(": ").concat(phoneNumber);
+      case 'call':
+        result = result.concat(': ').concat(phoneNumber);
         break;
-      }
-      case 'share': {
+      case 'share':
         return null;
-      }
     }
     return result;
   }
 
   async _handleTextMessageWithActions(actions, globalActions, headerText, footerText, messagePayload, data) {
     logger.info('Handle text message with actions');
-    let self = this;
-    const postbackActions = await self._getPostbackActions(actions, globalActions, 'postback');
+    const postbackActions = await this._getPostbackActions(actions, globalActions, 'postback');
     const totalPostbackActions = postbackActions.postback ? postbackActions.postback.length : 0;
 
     if (totalPostbackActions > 0) {
       if (totalPostbackActions < 4) {
-        await self._handlePostbackActionsButtonItems(postbackActions.postback, headerText, footerText, messagePayload.text, null, data);
-      } else if (totalPostbackActions >= 4 && totalPostbackActions <= 10) {
-        await self._handlePostbackActionsListItems(postbackActions.postback, headerText, footerText, messagePayload, null, data);
-      } else if (totalPostbackActions > 10) {
-        await self._handlePostbackActionsTextItems(postbackActions, headerText, footerText, messagePayload.text, data);
+        await this._handlePostbackActionsButtonItems(postbackActions.postback, headerText, footerText, messagePayload.text, null, data);
+      } else if (totalPostbackActions <= 10) {
+        await this._handlePostbackActionsListItems(postbackActions.postback, headerText, footerText, messagePayload, null, data);
+      } else {
+        await this._handlePostbackActionsTextItems(postbackActions, headerText, footerText, messagePayload.text, data);
       }
-    } else { // other types
-      const otherActions = await self._getPostbackActions(actions, globalActions, 'other');
-      await self._handlePostbackActionsTextItems(otherActions, headerText, footerText, messagePayload.text, data)
+    } else {
+      const otherActions = await this._getPostbackActions(actions, globalActions, 'other');
+      await this._handlePostbackActionsTextItems(otherActions, headerText, footerText, messagePayload.text, data);
     }
   }
 
@@ -457,47 +357,40 @@ class WhatsApp {
     globalActions = globalActions ? globalActions : [];
     actions = actions.concat(globalActions);
     actions = _.groupBy(actions, 'type');
-    if (type === 'postback') {
-      return _.pick(actions, ['postback']);
-    } else {
-      return _.omit(actions, ['postback']);
-    }
+    return type === 'postback' ? _.pick(actions, ['postback']) : _.omit(actions, ['postback']);
   }
 
   async _handleCardMessage(cards, globalActions, headerText, footerText, data) {
     logger.info('Handle card message with actions');
-    let self = this;
-    const totalActions = cards.reduce((sum, card) => {
-      return sum + (card.actions ? card.actions.length : 0);
-    }, 0) + (globalActions ? globalActions.length : 0);
 
-    const actions = cards.reduce((result, card) => {
-      return card.actions ? result.concat(card.actions) : result;
-    }, []);
+    const totalActions =
+      cards.reduce((sum, card) => sum + (card.actions ? card.actions.length : 0), 0) +
+      (globalActions ? globalActions.length : 0);
 
-    const postbackActions = await self._getPostbackActions(actions, globalActions, 'postback');
+    const actions = cards.reduce((result, card) => (card.actions ? result.concat(card.actions) : result), []);
+    const postbackActions = await this._getPostbackActions(actions, globalActions, 'postback');
     const totalPostbackActions = postbackActions.postback ? postbackActions.postback.length : 0;
+
     if (totalPostbackActions > 0) {
       const image = cards[0].imageUrl ? cards[0].imageUrl : null;
       const title = cards[0].title ? cards[0].title : headerText;
 
       if (totalPostbackActions < 4) {
-        await self._handlePostbackActionsButtonItems(postbackActions.postback, headerText, footerText, title, image, data);
-      } else if (totalPostbackActions >= 4 && totalPostbackActions <= 10) {
-        await self._handlePostbackActionsListItems(postbackActions.postback, headerText, footerText, title, image, data);
+        await this._handlePostbackActionsButtonItems(postbackActions.postback, headerText, footerText, title, image, data);
+      } else if (totalPostbackActions <= 10) {
+        await this._handlePostbackActionsListItems(postbackActions.postback, headerText, footerText, title, image, data);
       } else if (totalActions > 10) {
-        await self._handlePostbackActionsTextItems(postbackActions, headerText, footerText, headerText, data);
+        await this._handlePostbackActionsTextItems(postbackActions, headerText, footerText, headerText, data);
       }
-    } else { // other types
-      const otherActions = await self._getPostbackActions(actions, globalActions, 'other');
-      await self._handlePostbackActionsTextItems(otherActions, headerText, footerText, headerText, data)
+    } else {
+      const otherActions = await this._getPostbackActions(actions, globalActions, 'other');
+      await this._handlePostbackActionsTextItems(otherActions, headerText, footerText, headerText, data);
     }
   }
 
   _sendToWhatsApp(message) {
-    let self = this;
-    self.whatsAppSender._queueMessage(message);
+    this.whatsAppSender._queueMessage(message);
   }
-};
+}
 
 module.exports = WhatsApp;
