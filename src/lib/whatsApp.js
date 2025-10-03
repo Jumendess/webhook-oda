@@ -3,6 +3,7 @@ const WhatsAppSender = require('./whatsAppSender');
 const _ = require('underscore');
 const { MessageModel } = require('@oracle/bots-node-sdk/lib');
 const log4js = require('log4js');
+const axios = require('axios'); // usado no envio (upload opcional para media_id)
 let logger = log4js.getLogger('WhatsApp');
 const Config = require('../../config/Config');
 logger.level = Config.LOG_LEVEL;
@@ -31,7 +32,7 @@ class WhatsApp {
    */
   async _getWhatsAppMessages(payload) {
     const odaMessages = [];
-    const entries = payload;
+    const entries = payload || [];
 
     for (const entry of entries) {
       const changes = entry.changes || [];
@@ -54,11 +55,7 @@ class WhatsApp {
   }
 
   /**
-   * Process WhatsApp message per type and convert to ODA message format.
-   * @param {object} message - Whatsapp Message
-   * @param {string} userId
-   * @param {string} contactName
-   * @returns {object|null} ODA message
+   * Converte cada mensagem de WhatsApp para o formato do ODA
    */
   async _processMessage(message, userId, contactName) {
     let odaMessage = null;
@@ -146,10 +143,9 @@ class WhatsApp {
   }
 
   /**
-   * Recebe mídia do WhatsApp e envia ao ODA como ATTACHMENT (image/audio/video/file)
-   * Usa o WhatsAppSender para:
-   *  - baixar mídia da Graph API (usando attachment.id)
-   *  - subir no GCS e gerar URL assinada
+   * ENTRADA: Recebe mídia do WhatsApp e envia ao ODA como ATTACHMENT (image/audio/video/file)
+   * - Baixa mídia via Graph (usando attachment.id)
+   * - Sobe no GCS e gera URL assinada
    */
   async _createAttachmentMessage(userId, contactName, attachment, type) {
     const fileUrl = await this.whatsAppSender._downloadAndSaveWhatsAppAttachmentMessage(attachment);
@@ -164,26 +160,32 @@ class WhatsApp {
       case 'audio':    odaAttachmentType = 'audio'; break;
       case 'video':    odaAttachmentType = 'video'; break;
       case 'document': odaAttachmentType = 'file';  break;
+      default:         odaAttachmentType = 'file';
     }
 
-    const title = attachment.caption || attachment.filename || undefined;
+    // título (caption/filename) – útil para PDF/arquivo; áudio PTT pode não ter filename
+    let title = attachment.caption || attachment.filename || undefined;
+    if (!title && type === 'audio') title = 'audio.ogg'; // default amigável para PTT
 
-    return {
+    const odaMsg = {
       userId,
       messagePayload: {
         type: 'attachment',
         attachment: {
-          type: odaAttachmentType,   // image | audio | video | file
-          url: fileUrl,              // URL assinada do GCP
-          title                      // opcional
+          type: odaAttachmentType, // image | audio | video | file
+          url: fileUrl,            // URL assinada do GCP
+          title                    // opcional
         }
       },
       profile: { whatsAppNumber: userId, contactName }
     };
+
+    logger.info(`[ATTACHMENT->ODA] type=${odaAttachmentType} title=${title}`);
+    return odaMsg;
   }
 
   /** --------------------------
-   *      ENVIO PARA WHATSAPP
+   *      SAÍDA PARA WHATSAPP
    *  -------------------------- */
 
   async _send(payload) {
@@ -204,7 +206,7 @@ class WhatsApp {
     } else if (this._isCardMessage(type, messagePayload.cards)) {
       await this._handleCardMessage(messagePayload.cards, globalActions, headerText, footerText, data);
     } else if (this._isAttachmentMessage(type, messagePayload.attachment)) {
-      await this._handleAttachmentMessage(messagePayload.attachment, data);
+      await this._handleAttachmentMessage(messagePayload.attachment, data); // definido abaixo
     } else {
       return;
     }
@@ -385,6 +387,84 @@ class WhatsApp {
     } else {
       const otherActions = await this._getPostbackActions(actions, globalActions, 'other');
       await this._handlePostbackActionsTextItems(otherActions, headerText, footerText, headerText, data);
+    }
+  }
+
+  /**
+   * SAÍDA (ODA->WhatsApp): envia attachment.
+   * - Por padrão usa LINK (compatível com seu código atual).
+   * - Se WHATSAPP_UPLOAD_MEDIA=true e existir this.whatsAppSender._uploadToWhatsAppMedia, faz upload pro WhatsApp e envia por media_id.
+   */
+  async _handleAttachmentMessage(attachment, data) {
+    const { type, url, title } = attachment || {};
+    if (!type || !url) {
+      logger.warn('Attachment inválido recebido do ODA:', attachment);
+      return;
+    }
+
+    // Upload opcional para media_id (feature flag + método disponível)
+    const wantUpload = String(process.env.WHATSAPP_UPLOAD_MEDIA || '').toLowerCase() === 'true';
+    const canUpload = typeof this.whatsAppSender._uploadToWhatsAppMedia === 'function';
+
+    if (wantUpload && canUpload) {
+      try {
+        // baixa a mídia a partir da URL do ODA
+        const res = await axios.get(url, { responseType: 'arraybuffer' });
+        const buffer = Buffer.from(res.data);
+        const mimeType = res.headers['content-type'] || 'application/octet-stream';
+
+        const mediaId = await this.whatsAppSender._uploadToWhatsAppMedia(buffer, mimeType);
+        logger.info(`[ODA->WA] Enviando ${type} por media_id`);
+
+        switch (type) {
+          case 'image':
+            data.type = 'image';
+            data.image = { id: mediaId };
+            if (title) data.image.caption = title;
+            return;
+          case 'video':
+            data.type = 'video';
+            data.video = { id: mediaId };
+            if (title) data.video.caption = title;
+            return;
+          case 'audio':
+            data.type = 'audio';
+            data.audio = { id: mediaId };
+            return;
+          default: // 'file' | 'document'
+            data.type = 'document';
+            data.document = { id: mediaId };
+            if (title) data.document.caption = title;
+            return;
+        }
+      } catch (e) {
+        logger.error('Falha no upload para media_id, usando fallback por link:', e?.message || e);
+        // segue para fallback por link
+      }
+    }
+
+    // Fallback padrão por LINK (comportamento original)
+    logger.info(`[ODA->WA] Enviando ${type} por link`);
+    switch (type) {
+      case 'image':
+        data.type = 'image';
+        data.image = { link: url };
+        if (title) data.image.caption = title;
+        break;
+      case 'video':
+        data.type = 'video';
+        data.video = { link: url };
+        if (title) data.video.caption = title;
+        break;
+      case 'audio':
+        data.type = 'audio';
+        data.audio = { link: url };
+        break;
+      default: // 'file' | 'document'
+        data.type = 'document';
+        data.document = { link: url };
+        if (title) data.document.caption = title;
+        break;
     }
   }
 
