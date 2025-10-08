@@ -1,26 +1,24 @@
-// ODA Details
-exports.ODA_WEBHOOK_URL = process.env.ODA_WEBHOOK_URL || '';
-exports.ODA_WEBHOOK_SECRET = process.env.ODA_WEBHOOK_SECRET || '';
+// config/Config.js
+module.exports = {
+  LOG_LEVEL: process.env.LOG_LEVEL || 'info',
 
-// WhatsApp Details
-exports.API_URL = 'https://graph.facebook.com';
-exports.ENDPOINT_API = 'messages';
-exports.VERIFY_TOKEN = process.env.VERIFY_TOKEN || '';
-exports.ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
-exports.API_VERSION = process.env.VERSION || 'v16.0';
-exports.PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || '';
-exports.LIST_TITLE_DEFAULT_LABEL = 'Select one';
+  // WhatsApp Cloud API
+  API_URL: process.env.API_URL,
+  API_VERSION: process.env.API_VERSION,
+  PHONE_NUMBER_ID: process.env.PHONE_NUMBER_ID,
+  ACCESS_TOKEN: process.env.ACCESS_TOKEN,
 
-// General Detail
-exports.port = process.env.port || 3000;
-exports.FILES_URL = process.env.FILES_URL;
-exports.LOG_LEVEL = 'info';
+  // Controle interno de filas/eventos (se já tiver no seu projeto, mantenha)
+  EVENT_QUEUE_MESSAGE_TO_WHATSAPP: 'QUEUE_MESSAGE_TO_WHATSAPP',
+  EVENT_WHATSAPP_MESSAGE_DELIVERED: 'WHATSAPP_MESSAGE_DELIVERED',
+  EVENT_PROCESS_NEXT_WHATSAPP_MESSAGE: 'PROCESS_NEXT_WHATSAPP_MESSAGE',
+  ENDPOINT_API: 'messages',
 
-// WhatsApp Sender event IDs
-exports.EVENT_QUEUE_MESSAGE_TO_WHATSAPP = "100";
-exports.EVENT_WHATSAPP_MESSAGE_DELIVERED = "1000";
-exports.EVENT_PROCESS_NEXT_WHATSAPP_MESSAGE = "2000";
+  // S3
+  AWS_REGION: process.env.AWS_REGION,
+  AWS_S3_BUCKET: process.env.AWS_S3_BUCKET,
+  AWS_SIGNED_URL_EXPIRATION: parseInt(process.env.AWS_SIGNED_URL_EXPIRATION || '3600', 10),
 
-exports.GCP_BUCKET_NAME = process.env.GCP_BUCKET_NAME;
-// exports.GOOGLE_CLOUD_CREDENTIALS = process.env.GOOGLE_CLOUD_CREDENTIALS;
-
+  // feature flag para upload de mídia vindo do WhatsApp
+  WHATSAPP_UPLOAD_MEDIA: (process.env.WHATSAPP_UPLOAD_MEDIA || 'true').toLowerCase() === 'true',
+};
