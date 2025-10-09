@@ -1,43 +1,53 @@
-// src/server.js
 require('dotenv').config();
+
 const express = require('express');
+const bodyParser = require('body-parser');
 const path = require('path');
 const log4js = require('log4js');
 
-const WhatsApp = require('./lib/whatsApp');
-// ATENÇÃO: confira o caminho; se seu Config fica em 'src/config/Config.js',
-// e este server.js está em 'src/server.js', o require correto é '../config/Config'
 const Config = require('../config/Config');
+const WhatsApp = require('./lib/whatsApp');
 
-const OracleBot = require('@oracle/bots-node-sdk');
-const { WebhookClient } = OracleBot.Middleware;
+let logger = log4js.getLogger('Server');
+logger.level = Config.LOG_LEVEL;
 
-const logger = log4js.getLogger('Server');
-logger.level = Config.LOG_LEVEL || 'info';
+// ----- Validação mínima das ENV obrigatórias -----
+if (!Config.ODA_WEBHOOK_URL) {
+  throw new Error('Faltando ODA_WEBHOOK_URL nas variáveis de ambiente.');
+}
+if (!Config.ODA_WEBHOOK_SECRET) {
+  throw new Error('Faltando ODA_WEBHOOK_SECRET nas variáveis de ambiente.');
+}
 
 const app = express();
 
-// JSON parser
-app.use(express.json({ limit: '10mb' }));
+// Body parser (aumente se necessário para anexos grandes vindos do ODA)
+app.use(bodyParser.json({ limit: '2mb' }));
 
-// CORS simples (se quiser, restrinja ao seu domínio)
+// CORS simples para servir /uploads e testes
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header(
     'Access-Control-Allow-Headers',
     'Origin, X-Requested-With, Content-Type, Accept'
   );
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
-// Static (se você realmente serve algo de /public/uploads)
+// Static (seu projeto usa essa pasta para servir arquivos, quando aplicável)
 const staticPath = path.resolve('public', 'uploads');
 app.use('/uploads', express.static(staticPath));
 
-// Oracle Bot
+// ---------- Oracle Digital Assistant Webhook ----------
+const OracleBot = require('@oracle/bots-node-sdk');
+const { WebhookClient } = OracleBot.Middleware;
+
+// Inicializa SDK (habilita logs bonitos no console, etc.)
 OracleBot.init(app, { logger });
 
-// Webhook ODA
+// Cria o cliente do canal Webhook do ODA
 const webhook = new WebhookClient({
   channel: {
     url: Config.ODA_WEBHOOK_URL,
@@ -45,76 +55,80 @@ const webhook = new WebhookClient({
   }
 });
 
-// WhatsApp connector
+// ---------- WhatsApp Connector ----------
 const whatsApp = new WhatsApp();
 
+// ---------- Rotas ----------
+
 // Healthcheck
-app.get('/health', (_req, res) => res.status(200).send('OK'));
+app.get('/', (_req, res) => {
+  res.status(200).send('Oracle Digital Assistant Webhook ativo.');
+});
 
-// Home
-app.get('/', (_req, res) =>
-  res.send('Oracle Digital Assistant Webhook rodando.')
-);
-
-// Verificação do webhook do WhatsApp
+// Verificação do webhook do WhatsApp (GET)
 app.get('/user/message', (req, res) => {
   try {
-    logger.info('Verifying WhatsApp webhook…');
+    logger.info('Verificando webhook do WhatsApp (GET /user/message).');
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
+
     if (mode === 'subscribe' && token === Config.VERIFY_TOKEN) {
-      res.status(200).send(challenge);
-    } else {
-      res.sendStatus(403);
+      logger.info('Webhook do WhatsApp verificado com sucesso.');
+      return res.status(200).send(challenge);
     }
+    return res.sendStatus(403);
   } catch (err) {
-    logger.error(err);
-    res.sendStatus(500);
-  }
-});
-
-// Recebe mensagens do WhatsApp -> envia para ODA
-app.post('/user/message', async (req, res) => {
-  try {
-    logger.info('Received a message from WhatsApp, forwarding to ODA.');
-    const response = await whatsApp._receive(req.body.entry);
-
-    if (response && response.length) {
-      for (const msg of response) {
-        await webhook.send(msg);
-        logger.info('Message sent to ODA.');
-      }
-      return res.sendStatus(200);
-    }
-    logger.error('Unsupported message type');
-    return res.status(400).send('Unsupported message type');
-  } catch (err) {
-    logger.error(err);
+    logger.error('Erro na verificação do webhook WhatsApp:', err);
     return res.sendStatus(500);
   }
 });
 
-// Recebe mensagens do ODA -> envia para WhatsApp
-app.post('/bot/message', async (req, res) => {
+// Recebe mensagens do WhatsApp (POST) e repassa ao ODA
+app.post('/user/message', async (req, res) => {
   try {
-    logger.info('Received a message from ODA, sending to WhatsApp.');
-    await whatsApp._send(req.body);
-    logger.info('Message sent to WhatsApp.');
+    logger.info('Received a message from WhatsApp, forwarding to ODA.');
+    const entries = req.body.entry;
+    const odaMessages = await whatsApp._receive(entries);
+
+    if (Array.isArray(odaMessages) && odaMessages.length > 0) {
+      for (const message of odaMessages) {
+        await webhook.send(message);
+        logger.info('Message Sent successfully to ODA.');
+      }
+    } else {
+      logger.error('Unsupported message type ou payload vazio.');
+      // Não falhe o webhook do Meta; apenas 200 OK evita retries desnecessários
+    }
     return res.sendStatus(200);
   } catch (err) {
-    logger.error(err);
-    return res.status(500).send(err?.message || 'Error');
+    logger.error('Erro processando /user/message:', err);
+    // Ainda respondemos 200 para evitar retries agressivos do Meta;
+    // se quiser, mude para 500 durante diagnóstico:
+    return res.sendStatus(200);
   }
 });
 
-// >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-// LISTEN CORRETO PARA O RENDER
-// Sempre use process.env.PORT e host 0.0.0.0
-// Se quiser fallback local, deixe um default (ex.: 3000).
-const port = process.env.PORT || Config.PORT || 3000;
-
-app.listen(port, '0.0.0.0', () => {
-  logger.info(`Server listening on 0.0.0.0:${port}`);
+// Recebe mensagens do ODA (POST) e envia ao WhatsApp
+app.post('/bot/message', async (req, res) => {
+  try {
+    logger.info('Received a message from ODA, processing message before sending to WhatsApp.');
+    await whatsApp._send(req.body);
+    logger.info('Message Sent successfully to WhatsApp.');
+    return res.sendStatus(200);
+  } catch (err) {
+    logger.error('Erro processando /bot/message:', err);
+    return res.status(500).send(err?.message || 'Internal error');
+  }
 });
-// <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+// Middleware final de erro (fallback)
+app.use((err, _req, res, _next) => {
+  logger.error('Unhandled error:', err);
+  res.status(500).send('Internal Server Error');
+});
+
+// Sobe o servidor
+app.listen(Config.PORT, '0.0.0.0', () => {
+  logger.info(`Server listening on 0.0.0.0:${Config.PORT}`);
+});
