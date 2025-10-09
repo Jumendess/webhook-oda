@@ -4,32 +4,21 @@ const Emitter = require('events').EventEmitter;
 const log4js = require('log4js');
 const axios = require('axios');
 const mime = require('mime-types'); // detectar MIME automaticamente
-const { Storage } = require('@google-cloud/storage');
-const fs = require('fs');
-const path = require('path');
+
+// ===== AWS S3 (SDK v3) =====
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 let logger = log4js.getLogger('WhatsAppSender');
 logger.level = Config.LOG_LEVEL;
 
-/** Normaliza a private_key (\n -> quebra real) e retorna credenciais */
-function buildGcpCredentials() {
-  if (!process.env.GCP_SERVICE_ACCOUNT_JSON) {
-    throw new Error('GCP_SERVICE_ACCOUNT_JSON não definido.');
-  }
-  const raw = process.env.GCP_SERVICE_ACCOUNT_JSON;
-  const creds = JSON.parse(raw);
-  if (creds.private_key && creds.private_key.includes('\\n')) {
-    creds.private_key = creds.private_key.replace(/\\n/g, '\n');
-  }
-  return creds;
-}
-
-const creds = buildGcpCredentials();
-
-// Inicializa o cliente do Google Cloud Storage com projectId explícito
-const storage = new Storage({
-  projectId: creds.project_id,
-  credentials: creds,
+// ===== Cliente S3 =====
+const s3 = new S3Client({
+  region: process.env.AWS_REGION || Config.AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || Config.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || Config.AWS_SECRET_ACCESS_KEY,
+  },
 });
 
 class WhatsAppSender {
@@ -41,13 +30,7 @@ class WhatsAppSender {
     this.whatsAppVerifyToken = Config.VERIFY_TOKEN;
     this.whatsAppAccessToken = Config.ACCESS_TOKEN;
     this.whatsAppApiVersion = Config.API_VERSION;
-    this.whatsAppPhoneNumberId = Config.PHONE_NUMBER_ID;
 
-    this._setupEvents();
-    logger.info('WhatsApp Sender initialized');
-  }
-
-  _setupEvents() {
     const self = this;
 
     self.eventsEmitter.on(Config.EVENT_QUEUE_MESSAGE_TO_WHATSAPP, async (payload) => {
@@ -67,107 +50,99 @@ class WhatsAppSender {
       self.eventsEmitter.emit(Config.EVENT_PROCESS_NEXT_WHATSAPP_MESSAGE);
     });
 
-    self.eventsEmitter.on(Config.EVENT_PROCESS_NEXT_WHATSAPP_MESSAGE, () => {
+    self.eventsEmitter.on(Config.EVENT_PROCESS_NEXT_WHATSAPP_MESSAGE, async () => {
       if (self.messagesQueue.length > 0) {
-        const nextMessage = self.messagesQueue[self.messagesQueue.length - 1];
-        self._sendMessageToWhatsApp(nextMessage, self);
+        const next = self.messagesQueue[self.messagesQueue.length - 1];
+        await self._sendMessageToWhatsApp(next);
       }
     });
-  }
-
-  async _sendMessageToWhatsApp(message) {
-    const self = this;
-    try {
-      const config = {
-        method: 'post',
-        url: `${self.whatsAppApiUrl}/${self.whatsAppApiVersion}/${self.whatsAppPhoneNumberId}/${self.whatsAppEndpointApi}`,
-        headers: {
-          Authorization: `Bearer ${self.whatsAppAccessToken}`,
-          'Content-Type': 'application/json'
-        },
-        data: message
-      };
-
-      const response = await axios(config);
-      if (response.data && response.data.messages && response.data.messages[0]) {
-        self.eventsEmitter.emit(Config.EVENT_WHATSAPP_MESSAGE_DELIVERED, response.data.messages[0].id);
-      }
-    } catch (error) {
-      throw error;
-    }
   }
 
   _queueMessage(message) {
     this.eventsEmitter.emit(Config.EVENT_QUEUE_MESSAGE_TO_WHATSAPP, message);
   }
 
-  messageDelivered(messageId) {
-    this.eventsEmitter.emit(Config.EVENT_WHATSAPP_MESSAGE_DELIVERED, messageId);
+  async _sendMessageToWhatsApp(message) {
+    try {
+      const url = `${this.whatsAppApiUrl}/${this.whatsAppApiVersion}/${Config.PHONE_NUMBER_ID}/${this.whatsAppEndpointApi}`;
+      const headers = {
+        'Authorization': `Bearer ${this.whatsAppAccessToken}`,
+        'Content-Type': 'application/json'
+      };
+
+      const resp = await axios.post(url, message, { headers });
+      const messageId = resp?.data?.messages?.[0]?.id || '';
+      this.eventsEmitter.emit(Config.EVENT_WHATSAPP_MESSAGE_DELIVERED, messageId);
+    } catch (error) {
+      logger.error('Erro enviando mensagem ao WhatsApp:', error?.response?.data || error.message || error);
+      throw error;
+    }
   }
 
+  /**
+   * Envia um media_id para a API do WhatsApp (upload nativo da Meta)
+   * Mantido como no seu código original (interface compatível).
+   */
+  async _uploadToWhatsAppMedia(binary, mimeType) {
+    const url = `${this.whatsAppApiUrl}/${this.whatsAppApiVersion}/${Config.PHONE_NUMBER_ID}/media`;
+    const headers = {
+      'Authorization': `Bearer ${this.whatsAppAccessToken}`,
+      'Content-Type': mimeType || 'application/octet-stream'
+    };
+    const resp = await axios.post(url, binary, { headers });
+    return resp?.data?.id;
+  }
+
+  /**
+   * Baixa a mídia do WhatsApp (via Graph) e SALVA no S3.
+   * Retorna uma URL ASSINADA temporária para leitura.
+   * => Mantém o mesmo nome/método que seu fluxo já usa.
+   */
   async _downloadAndSaveWhatsAppAttachmentMessage(attachment) {
     try {
-      // 1) Recupera URL da mídia no WhatsApp
+      // 1) Recupera URL da mídia no WhatsApp (Graph)
       const metaResp = await axios.get(
         `${this.whatsAppApiUrl}/${this.whatsAppApiVersion}/${attachment.id}`,
         { headers: { Authorization: `Bearer ${this.whatsAppAccessToken}` } }
       );
-
       if (!metaResp.data.url) {
         console.error("URL do anexo não encontrada! Resposta:", metaResp.data);
         return null;
       }
 
-      // 2) Faz download da mídia
+      // 2) Baixa o binário
       const fileResponse = await axios.get(metaResp.data.url, {
         headers: { Authorization: `Bearer ${this.whatsAppAccessToken}` },
         responseType: "arraybuffer",
       });
 
-      const mimeType = attachment.mime_type || 'application/octet-stream';
+      const mimeType = attachment?.mime_type || fileResponse.headers['content-type'] || 'application/octet-stream';
       const fileExtension = mime.extension(mimeType) || 'bin';
       const fileName = `whatsapp_${Date.now()}.${fileExtension}`;
 
-      // 3) Salva em /tmp e faz upload para o bucket
-      const tempFilePath = path.join('/tmp', fileName);
-      fs.writeFileSync(tempFilePath, Buffer.from(fileResponse.data));
+      // 3) Upload ao S3
+      await s3.send(new PutObjectCommand({
+        Bucket: process.env.AWS_S3_BUCKET || Config.AWS_S3_BUCKET,
+        Key: fileName,
+        Body: Buffer.from(fileResponse.data),
+        ContentType: mimeType,
+      }));
 
-      const bucket = storage.bucket(Config.GCP_BUCKET_NAME);
-      await bucket.upload(tempFilePath, {
-        destination: fileName,
-        resumable: false,
-        validation: false,
-        metadata: { contentType: mimeType }
-      });
+      // 4) Assina URL (GET) com expiração configurável
+      const expiresIn = parseInt(process.env.AWS_SIGNED_URL_EXPIRATION || Config.AWS_SIGNED_URL_EXPIRATION || '3600', 10);
+      const signedUrl = await getSignedUrl(
+        s3,
+        new GetObjectCommand({
+          Bucket: process.env.AWS_S3_BUCKET || Config.AWS_S3_BUCKET,
+          Key: fileName
+        }),
+        { expiresIn }
+      );
 
-      fs.unlinkSync(tempFilePath);
+      console.log(`✅ Arquivo salvo em: s3://${process.env.AWS_S3_BUCKET || Config.AWS_S3_BUCKET}/${fileName}`);
+      console.log(`📎 URL temporária (${expiresIn}s): ${signedUrl}`);
+      return signedUrl;
 
-      const file = bucket.file(fileName);
-
-      // 4) Tenta gerar URL assinada (V4)
-      try {
-        const [signedUrl] = await file.getSignedUrl({
-          version: 'v4',
-          action: 'read',
-          expires: Date.now() + 60 * 60 * 1000 // 1h
-        });
-        console.log(`✅ Arquivo salvo em: gs://${Config.GCP_BUCKET_NAME}/${fileName}`);
-        console.log(`📎 URL temporária (1h): ${signedUrl}`);
-        return signedUrl;
-      } catch (signErr) {
-        console.error('Falha ao assinar URL (getSignedUrl). Tentando fallback...', signErr?.message || signErr);
-
-        // 5) Fallback opcional: tornar o objeto público se habilitado em env
-        if (process.env.GCS_MAKE_PUBLIC_FALLBACK === 'true') {
-          await file.makePublic();
-          const publicUrl = `https://storage.googleapis.com/${Config.GCP_BUCKET_NAME}/${encodeURIComponent(fileName)}`;
-          console.log(`🌐 Fallback público habilitado. URL: ${publicUrl}`);
-          return publicUrl;
-        }
-
-        // Se não puder tornar público, propaga erro
-        throw signErr;
-      }
     } catch (error) {
       const friendly =
         error?.response?.data
@@ -179,7 +154,6 @@ class WhatsAppSender {
   }
 }
 
-// Exporta a classe, storage e Config
+// Exporta a classe e o Config
 module.exports = WhatsAppSender;
-module.exports.storage = storage;
 module.exports.Config = Config;

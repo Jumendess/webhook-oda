@@ -21,6 +21,14 @@ exports.EVENT_QUEUE_MESSAGE_TO_WHATSAPP = "100";
 exports.EVENT_WHATSAPP_MESSAGE_DELIVERED = "1000";
 exports.EVENT_PROCESS_NEXT_WHATSAPP_MESSAGE = "2000";
 
+// (Deixa aqui se quiser fallback futuro de GCP)
 exports.GCP_BUCKET_NAME = process.env.GCP_BUCKET_NAME;
-// exports.GOOGLE_CLOUD_CREDENTIALS = process.env.GOOGLE_CLOUD_CREDENTIALS;
 
+// ============================
+// AWS S3 configuration
+// ============================
+exports.AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID || '';
+exports.AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY || '';
+exports.AWS_REGION = process.env.AWS_REGION || 'us-east-1';
+exports.AWS_S3_BUCKET = process.env.AWS_S3_BUCKET || '';
+exports.AWS_SIGNED_URL_EXPIRATION = parseInt(process.env.AWS_SIGNED_URL_EXPIRATION || '3600', 10);
