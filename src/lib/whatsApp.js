@@ -26,6 +26,18 @@ class WhatsApp {
   }
 
   /**
+   * Helper: channelExtensions usados pelo ODA para manter a mesma conversa
+   */
+  _channelExtensions(userId, contactName) {
+    return {
+      source: 'whatsapp',
+      conversationKey: userId,     // <- chave estável da conversa
+      externalUserId: userId,
+      externalUserName: contactName || undefined
+    };
+  }
+
+  /**
    * Process WhatsApp messages and convert to ODA message format.
    * @param {object[]} payload - Whatsapp Messages array to be processed.
    * @returns {object[]} Array de mensagens do ODA
@@ -104,7 +116,10 @@ class WhatsApp {
   _createTextMessage(userId, contactName, body) {
     return {
       userId,
-      messagePayload: MessageModel.textConversationMessage(body),
+      messagePayload: {
+        ...MessageModel.textConversationMessage(body),
+        channelExtensions: this._channelExtensions(userId, contactName)
+      },
       profile: { whatsAppNumber: userId, contactName }
     };
   }
@@ -114,14 +129,22 @@ class WhatsApp {
       case 'button_reply':
         return {
           userId,
-          messagePayload: { type: 'postback', postback: { action: interactive.button_reply.id } },
+          messagePayload: {
+            type: 'postback',
+            postback: { action: interactive.button_reply.id },
+            channelExtensions: this._channelExtensions(userId, contactName)
+          },
           profile: { whatsAppNumber: userId, contactName }
         };
 
       case 'list_reply':
         return {
           userId,
-          messagePayload: { type: 'postback', postback: { action: interactive.list_reply.id } },
+          messagePayload: {
+            type: 'postback',
+            postback: { action: interactive.list_reply.id },
+            channelExtensions: this._channelExtensions(userId, contactName)
+          },
           profile: { whatsAppNumber: userId, contactName }
         };
 
@@ -136,7 +159,8 @@ class WhatsApp {
       userId,
       messagePayload: {
         type: 'location',
-        location: { latitude: location.latitude, longitude: location.longitude }
+        location: { latitude: location.latitude, longitude: location.longitude },
+        channelExtensions: this._channelExtensions(userId, contactName)
       },
       profile: { whatsAppNumber: userId, contactName }
     };
@@ -145,7 +169,7 @@ class WhatsApp {
   /**
    * ENTRADA: Recebe mídia do WhatsApp e envia ao ODA como ATTACHMENT (image/audio/video/file)
    * - Baixa mídia via Graph (usando attachment.id)
-   * - Sobe no GCS e gera URL assinada
+   * - Sobe no S3 e gera URL assinada
    */
   async _createAttachmentMessage(userId, contactName, attachment, type) {
     const fileUrl = await this.whatsAppSender._downloadAndSaveWhatsAppAttachmentMessage(attachment);
@@ -173,9 +197,10 @@ class WhatsApp {
         type: 'attachment',
         attachment: {
           type: odaAttachmentType, // image | audio | video | file
-          url: fileUrl,            // URL assinada do GCP
+          url: fileUrl,            // URL assinada do S3
           title                    // opcional
-        }
+        },
+        channelExtensions: this._channelExtensions(userId, contactName)
       },
       profile: { whatsAppNumber: userId, contactName }
     };
