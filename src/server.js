@@ -5,7 +5,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const log4js = require('log4js');
 
-const Config = require('./config/Config');
+const Config = require('../config/Config');
 const WhatsApp = require('./src/lib/whatsApp');
 
 // ODA SDK
