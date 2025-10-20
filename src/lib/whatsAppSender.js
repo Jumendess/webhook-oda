@@ -1,9 +1,9 @@
-// WhatsAppSender.js
+// src/lib/whatsAppSender.js
 const Config = require('../../config/Config');
 const Emitter = require('events').EventEmitter;
 const log4js = require('log4js');
 const axios = require('axios');
-const mime = require('mime-types'); // detectar MIME automaticamente
+const mime = require('mime-types');
 
 // ===== AWS S3 (SDK v3) =====
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
@@ -80,8 +80,7 @@ class WhatsAppSender {
   }
 
   /**
-   * Envia um media_id para a API do WhatsApp (upload nativo da Meta)
-   * Mantido como no seu código original (interface compatível).
+   * Upload nativo da mídia para a API do WhatsApp (Graph)
    */
   async _uploadToWhatsAppMedia(binary, mimeType) {
     const url = `${this.whatsAppApiUrl}/${this.whatsAppApiVersion}/${Config.PHONE_NUMBER_ID}/media`;
@@ -96,7 +95,6 @@ class WhatsAppSender {
   /**
    * Baixa a mídia do WhatsApp (via Graph) e SALVA no S3.
    * Retorna uma URL ASSINADA temporária para leitura.
-   * => Mantém o mesmo nome/método que seu fluxo já usa.
    */
   async _downloadAndSaveWhatsAppAttachmentMessage(attachment) {
     try {
@@ -154,6 +152,5 @@ class WhatsAppSender {
   }
 }
 
-// Exporta a classe e o Config
 module.exports = WhatsAppSender;
 module.exports.Config = Config;

@@ -14,6 +14,12 @@ logger.level = Config.LOG_LEVEL;
 class WhatsApp {
   constructor() {
     this.whatsAppSender = new WhatsAppSender();
+
+    // ======= NOVO: controles em memória =======
+    // evita processar o mesmo webhook mais de uma vez (retries do Meta)
+    this._processedMessageIds = new Set();
+    // trava múltiplas respostas para a MESMA mensagem interativa (lista/botão)
+    this._consumedInteractiveContextIds = new Set();
   }
 
   /**
@@ -58,8 +64,18 @@ class WhatsApp {
         const contactName = (change.value.contacts && change.value.contacts[0]?.profile?.name) || '';
 
         for (const message of messages) {
+          // ======= NOVO: idempotência por message.id =======
+          const incomingId = message.id || message.key?.id;
+          if (incomingId && this._processedMessageIds.has(incomingId)) {
+            logger.info(`[DEDUP] Ignorando mensagem repetida ${incomingId}`);
+            continue;
+          }
+
           const odaMessage = await this._processMessage(message, userId, contactName);
-          if (odaMessage) odaMessages.push(odaMessage);
+          if (odaMessage) {
+            odaMessages.push(odaMessage);
+            if (incomingId) this._processedMessageIds.add(incomingId);
+          }
         }
       }
     }
@@ -77,9 +93,33 @@ class WhatsApp {
         odaMessage = this._createTextMessage(userId, contactName, message.text.body);
         break;
 
-      case 'interactive':
+      case 'interactive': {
+        // ======= NOVO: trava um-clique-só para botão e lista (list_reply / button_reply)
+        const contextId = message?.context?.id;
+        if (contextId && this._consumedInteractiveContextIds.has(contextId)) {
+          logger.info(`[LOCK] Resposta extra ignorada para o mesmo menu: ${contextId}`);
+          return null;
+        }
+        if (contextId) this._consumedInteractiveContextIds.add(contextId);
+
+        // feedback opcional de “desativado”
+        const chosenTitle =
+          message.interactive?.button_reply?.title ||
+          message.interactive?.list_reply?.title;
+
+        if (chosenTitle) {
+          this._sendToWhatsApp({
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to: userId,
+            type: 'text',
+            text: { body: `✅ Você escolheu: *${chosenTitle}*\n🔒 Opções bloqueadas para seguir o fluxo.` }
+          });
+        }
+
         odaMessage = await this._createInteractiveMessage(userId, contactName, message.interactive);
         break;
+      }
 
       case 'location':
         odaMessage = this._createLocationMessage(userId, contactName, message.location);
@@ -109,15 +149,13 @@ class WhatsApp {
     return odaMessage;
   }
 
-  /** --------------------------
-   *    BUILDERS DE MENSAGEM
-   *  -------------------------- */
-
-  _createTextMessage(userId, contactName, body) {
+  // ======= BUILDERS (WhatsApp -> ODA) =======
+  _createTextMessage(userId, contactName, text) {
     return {
       userId,
       messagePayload: {
-        ...MessageModel.textConversationMessage(body),
+        type: 'text',
+        text,
         channelExtensions: this._channelExtensions(userId, contactName)
       },
       profile: { whatsAppNumber: userId, contactName }
@@ -125,58 +163,57 @@ class WhatsApp {
   }
 
   async _createInteractiveMessage(userId, contactName, interactive) {
-    switch (interactive.type) {
-      case 'button_reply':
-        return {
-          userId,
-          messagePayload: {
-            type: 'postback',
-            postback: { action: interactive.button_reply.id },
-            channelExtensions: this._channelExtensions(userId, contactName)
-          },
-          profile: { whatsAppNumber: userId, contactName }
-        };
+    // Converte o reply (botão/lista) em "postback" para o ODA
+    const id =
+      interactive?.button_reply?.id || interactive?.list_reply?.id || '';
+    const title =
+      interactive?.button_reply?.title || interactive?.list_reply?.title || '';
 
-      case 'list_reply':
-        return {
-          userId,
-          messagePayload: {
-            type: 'postback',
-            postback: { action: interactive.list_reply.id },
-            channelExtensions: this._channelExtensions(userId, contactName)
-          },
-          profile: { whatsAppNumber: userId, contactName }
-        };
+    const text = id || title || ''; // o ODA costuma tratar postback.action ou texto
 
-      default:
-        logger.warn('Unsupported interactive type:', interactive.type);
-        return null;
-    }
-  }
-
-  _createLocationMessage(userId, contactName, location) {
     return {
       userId,
       messagePayload: {
-        type: 'location',
-        location: { latitude: location.latitude, longitude: location.longitude },
+        type: 'text',
+        text,
         channelExtensions: this._channelExtensions(userId, contactName)
       },
       profile: { whatsAppNumber: userId, contactName }
     };
   }
 
-  /**
-   * ENTRADA: Recebe mídia do WhatsApp e envia ao ODA como ATTACHMENT (image/audio/video/file)
-   * - Baixa mídia via Graph (usando attachment.id)
-   * - Sobe no S3 e gera URL assinada
-   */
+  _createLocationMessage(userId, contactName, location) {
+    return {
+      userId,
+      messagePayload: {
+        type: 'text',
+        text: `${location.latitude},${location.longitude}`, // ou mapeie para seu componente de localização no ODA
+        channelExtensions: Object.assign(
+          this._channelExtensions(userId, contactName),
+          {
+            special_field_type: 'location',
+            location: JSON.stringify(location)
+          }
+        )
+      },
+      profile: { whatsAppNumber: userId, contactName }
+    };
+  }
+
   async _createAttachmentMessage(userId, contactName, attachment, type) {
-    const fileUrl = await this.whatsAppSender._downloadAndSaveWhatsAppAttachmentMessage(attachment);
-    if (!fileUrl) {
-      logger.error('Falha ao obter URL do anexo (download/upload).');
+    if (!attachment || (!attachment.id && !attachment.link)) {
+      logger.warn('Attachment inválido recebido de WA:', attachment);
       return null;
     }
+
+    // baixa do WA (Graph) e salva no S3, gerando uma URL assinada
+    let fileUrl = null;
+    try {
+      fileUrl = await this.whatsAppSender._downloadAndSaveWhatsAppAttachmentMessage(attachment);
+    } catch (e) {
+      logger.error('Erro ao salvar anexo no S3:', e?.message || e);
+    }
+    if (!fileUrl) return null;
 
     let odaAttachmentType = 'file';
     switch (type) {
@@ -187,9 +224,9 @@ class WhatsApp {
       default:         odaAttachmentType = 'file';
     }
 
-    // título (caption/filename) – útil para PDF/arquivo; áudio PTT pode não ter filename
+    // título (caption/filename)
     let title = attachment.caption || attachment.filename || undefined;
-    if (!title && type === 'audio') title = 'audio.ogg'; // default amigável para PTT
+    if (!title && type === 'audio') title = 'audio.ogg';
 
     const odaMsg = {
       userId,
@@ -197,8 +234,8 @@ class WhatsApp {
         type: 'attachment',
         attachment: {
           type: odaAttachmentType, // image | audio | video | file
-          url: fileUrl,            // URL assinada do S3
-          title                    // opcional
+          url: fileUrl,
+          title
         },
         channelExtensions: this._channelExtensions(userId, contactName)
       },
@@ -212,7 +249,6 @@ class WhatsApp {
   /** --------------------------
    *      SAÍDA PARA WHATSAPP
    *  -------------------------- */
-
   async _send(payload) {
     const { userId, messagePayload } = payload;
     const { type, actions, globalActions, headerText, footerText, channelExtensions } = messagePayload;
@@ -231,7 +267,7 @@ class WhatsApp {
     } else if (this._isCardMessage(type, messagePayload.cards)) {
       await this._handleCardMessage(messagePayload.cards, globalActions, headerText, footerText, data);
     } else if (this._isAttachmentMessage(type, messagePayload.attachment)) {
-      await this._handleAttachmentMessage(messagePayload.attachment, data); // definido abaixo
+      await this._handleAttachmentMessage(messagePayload.attachment, data);
     } else {
       return;
     }
@@ -269,122 +305,21 @@ class WhatsApp {
     }
   }
 
-  async _handlePostbackActionsButtonItems(actions, headerText, footerText, bodyText, image, data) {
-    logger.info('Handle actions as a button items');
-    data.type = 'interactive';
-    data.interactive = {
-      type: 'button',
-      body: { text: bodyText },
-      action: { buttons: [] }
-    };
-
-    actions && actions.forEach(action => {
-      data.interactive.action.buttons.push({
-        type: 'reply',
-        reply: {
-          id: action.postback.action,
-          title: action.label.length < 21 ? action.label : action.label.substr(0, 16).concat('...')
-        }
-      });
-    });
-
-    if (image) {
-      data.interactive.header = { type: 'image', image: { link: image } };
-    } else if (headerText) {
-      data.interactive.header = { type: 'text', text: headerText };
-    }
-    if (footerText) data.interactive.footer = { text: footerText };
-  }
-
-  async _handlePostbackActionsListItems(actions, headerText, footerText, messagePayload, image, data) {
-    logger.info('Handle actions as a list items');
-    data.type = 'interactive';
-    data.interactive = {
-      type: 'list',
-      body: { text: messagePayload.text },
-      action: { button: 'Escolha uma opção', sections: [] }
-    };
-
-    const rows = [];
-    actions && actions.forEach(action => {
-      rows.push({
-        id: action.postback.action,
-        title: action.label.length < 24 ? action.label : action.label.substr(0, 20).concat('...')
-      });
-    });
-
-    data.interactive.action.sections.push({ rows });
-
-    if (image) {
-      data.interactive.header = { type: 'image', image: { link: image } };
-    } else if (headerText) {
-      data.interactive.header = { type: 'text', text: headerText };
-    }
-    if (footerText) data.interactive.footer = { text: footerText };
-  }
-
-  async _handlePostbackActionsTextItems(actions, headerText, footerText, bodyText, data) {
-    logger.info('Handle other actions (url, phone, etc) and ten more items');
-    let response = '';
-    if (headerText) response = response.concat(headerText).concat('\n\n');
-    response = response.concat(bodyText).concat('\n');
-
-    for (const key in actions) {
-      actions[key].forEach(action => {
-        const t = this._createWhatsAppAction(action, data);
-        if (t) response = response.concat('\n').concat(t);
-      });
-    }
-
-    if (footerText) response = response.concat('\n\n').concat(footerText);
-    data.type = 'text';
-    data.text = { body: response };
-  }
-
-  _createWhatsAppAction(odaAction, data) {
-    const { type, label, url, phoneNumber } = odaAction;
-    if (type === 'share') return;
-
-    let result = label ? label : '';
-    switch (type) {
-      case 'url':
-        data.preview_url = true;
-        result = result.concat(': ').concat(url);
-        break;
-      case 'call':
-        result = result.concat(': ').concat(phoneNumber);
-        break;
-      case 'share':
-        return null;
-    }
-    return result;
-  }
-
   async _handleTextMessageWithActions(actions, globalActions, headerText, footerText, messagePayload, data) {
     logger.info('Handle text message with actions');
-    const postbackActions = await this._getPostbackActions(actions, globalActions, 'postback');
-    const totalPostbackActions = postbackActions.postback ? postbackActions.postback.length : 0;
 
-    if (totalPostbackActions > 0) {
-      if (totalPostbackActions < 4) {
-        await this._handlePostbackActionsButtonItems(postbackActions.postback, headerText, footerText, messagePayload.text, null, data);
-      } else if (totalPostbackActions <= 10) {
-        await this._handlePostbackActionsListItems(postbackActions.postback, headerText, footerText, messagePayload, null, data);
-      } else {
-        await this._handlePostbackActionsTextItems(postbackActions, headerText, footerText, messagePayload.text, data);
-      }
+    const postback = await this._getPostbackActions(actions || [], globalActions || [], 'postback');
+    const totalPostback = postback.postback ? postback.postback.length : 0;
+
+    // com <= 3 vira "reply buttons"; com 4..10 vira "list"
+    if (totalPostback > 0 && totalPostback <= 3) {
+      await this._handlePostbackActionsButtonItems(postback.postback, headerText || messagePayload.text, footerText, headerText || messagePayload.text, null, data);
+    } else if (totalPostback > 3 && totalPostback <= 10) {
+      await this._handlePostbackActionsListItems(postback.postback, headerText || messagePayload.text, footerText, headerText || messagePayload.text, null, data);
     } else {
-      const otherActions = await this._getPostbackActions(actions, globalActions, 'other');
-      await this._handlePostbackActionsTextItems(otherActions, headerText, footerText, messagePayload.text, data);
+      const other = await this._getPostbackActions(actions || [], globalActions || [], 'other');
+      await this._handlePostbackActionsTextItems(other, headerText || messagePayload.text, footerText, headerText || messagePayload.text, data);
     }
-  }
-
-  async _getPostbackActions(actions, globalActions, type) {
-    actions = actions ? actions : [];
-    globalActions = globalActions ? globalActions : [];
-    actions = actions.concat(globalActions);
-    actions = _.groupBy(actions, 'type');
-    return type === 'postback' ? _.pick(actions, ['postback']) : _.omit(actions, ['postback']);
   }
 
   async _handleCardMessage(cards, globalActions, headerText, footerText, data) {
@@ -415,10 +350,83 @@ class WhatsApp {
     }
   }
 
+  async _getPostbackActions(actions, globalActions, filter = 'postback') {
+    const all = [].concat(actions || [], globalActions || []);
+    const res = { postback: [], other: [] };
+
+    all.forEach(a => {
+      if (a && a.type === 'postback' && a.postback && a.postback.action) {
+        res.postback.push(a);
+      } else {
+        res.other.push(a);
+      }
+    });
+
+    return filter === 'postback' ? { postback: res.postback } : res;
+  }
+
+  async _handlePostbackActionsButtonItems(actions, headerText, footerText, bodyText, image, data) {
+    logger.info('Handle actions as a button items');
+    data.type = 'interactive';
+    data.interactive = {
+      type: 'button',
+      body: { text: bodyText },
+      action: { buttons: [] }
+    };
+
+    actions && actions.forEach(action => {
+      data.interactive.action.buttons.push({
+        type: 'reply',
+        reply: {
+          id: action.postback.action,
+          title: action.label.length < 21 ? action.label : action.label.substr(0, 16).concat('...')
+        }
+      });
+    });
+
+    if (image) {
+      data.interactive.header = { type: 'image', image: { link: image } };
+    } else if (headerText) {
+      data.interactive.header = { type: 'text', text: headerText };
+    }
+    if (footerText) data.interactive.footer = { text: footerText };
+  }
+
+  async _handlePostbackActionsListItems(actions, headerText, footerText, titleText, image, data) {
+    logger.info('Handle actions as a list items');
+    data.type = 'interactive';
+    data.interactive = {
+      type: 'list',
+      header: headerText ? { type: 'text', text: headerText } : undefined,
+      body: { text: titleText || Config.LIST_TITLE_DEFAULT_LABEL },
+      footer: footerText ? { text: footerText } : undefined,
+      action: {
+        button: 'Selecionar',
+        sections: [
+          {
+            title: headerText || 'Opções',
+            rows: actions.map((a, i) => ({
+              id: a.postback.action,
+              title: a.label.length < 25 ? a.label : a.label.substr(0, 22) + '...',
+              description: a.postback?.variables?.description || undefined
+            }))
+          }
+        ]
+      }
+    };
+  }
+
+  async _handlePostbackActionsTextItems(actionsObj, headerText, footerText, bodyText, data) {
+    logger.info('Fallback: envia texto com opções numeradas');
+    const items = (actionsObj.postback || []).map((a, i) => `${i + 1}. ${a.label}`).join('\n');
+    data.type = 'text';
+    data.text = { body: `${bodyText}\n\n${items}` };
+  }
+
   /**
    * SAÍDA (ODA->WhatsApp): envia attachment.
    * - Por padrão usa LINK (compatível com seu código atual).
-   * - Se WHATSAPP_UPLOAD_MEDIA=true e existir this.whatsAppSender._uploadToWhatsAppMedia, faz upload pro WhatsApp e envia por media_id.
+   * - Se WHATSAPP_UPLOAD_MEDIA=true e existir _uploadToWhatsAppMedia, faz upload pro WhatsApp e envia por media_id.
    */
   async _handleAttachmentMessage(attachment, data) {
     const { type, url, title } = attachment || {};
@@ -427,13 +435,12 @@ class WhatsApp {
       return;
     }
 
-    // Upload opcional para media_id (feature flag + método disponível)
+    // Upload opcional para media_id
     const wantUpload = String(process.env.WHATSAPP_UPLOAD_MEDIA || '').toLowerCase() === 'true';
     const canUpload = typeof this.whatsAppSender._uploadToWhatsAppMedia === 'function';
 
     if (wantUpload && canUpload) {
       try {
-        // baixa a mídia a partir da URL do ODA
         const res = await axios.get(url, { responseType: 'arraybuffer' });
         const buffer = Buffer.from(res.data);
         const mimeType = res.headers['content-type'] || 'application/octet-stream';
@@ -468,7 +475,7 @@ class WhatsApp {
       }
     }
 
-    // Fallback padrão por LINK (comportamento original)
+    // Fallback padrão por LINK
     logger.info(`[ODA->WA] Enviando ${type} por link`);
     switch (type) {
       case 'image':
