@@ -8,34 +8,41 @@ let logger = log4js.getLogger('WhatsApp');
 const Config = require('../../config/Config');
 logger.level = Config.LOG_LEVEL;
 
-/* =========================================================================
- *  CONTEXTO DE MENUS (sem trava de 60s)
- *  - menuId: usado para identificar cliques do MESMO menu
- *  - __menus: guarda o payload desse menuId (para fallback)
- *  - __menuState: marca se já houve 1ª escolha + título da primeira opção
- *  - __lastMenuByUser: SEMPRE guarda o ÚLTIMO MENU enviado ao usuário;
- *    é ele que será reenviado na mensagem explicativa (lista ou botões).
- * ========================================================================= */
-const __menus = new Map();               // menuId -> { dataClonado }
-const __menuState = new Map();           // menuId -> { consumed: boolean, firstTitle?: string }
-const __lastMenuByUser = new Map();      // userId -> dataClonado (último menu enviado)
+const __menuLocks = new Map(); // menuId -> { consumed: boolean, timeoutId: Timeout }
+
 
 function __createMenuId() {
   return `menu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
 }
 
-function __rememberMenu(menuId, data) {
-  try {
-    const cloned = JSON.parse(JSON.stringify(data));
-    __menus.set(menuId, { data: cloned });
-  } catch (e) {
-    logger.warn('Falha ao armazenar menu para reenvio:', e?.message || e);
-  }
+function __setMenuLock(menuId, ttlMs = 60 * 1000) { // opcional (pré-registro no envio)
+  const old = __menuLocks.get(menuId);
+  if (old?.timeoutId) clearTimeout(old.timeoutId);
+  const timeoutId = setTimeout(() => __menuLocks.delete(menuId), ttlMs);
+  __menuLocks.set(menuId, { consumed: false, timeoutId });
 }
 
-function __getMenu(menuId) {
-  const found = __menus.get(menuId);
-  return found ? found.data : null;
+// Consome o lock de forma tolerante: aceita o primeiro clique mesmo que não tenha havido __setMenuLock antes.
+function __consumeMenuLock(menuId, ttlMs = 60 * 1000) {
+  const entry = __menuLocks.get(menuId);
+
+  // Caso 1: nunca vimos esse menuId -> aceita e cria registro como consumido
+  if (!entry) {
+    const timeoutId = setTimeout(() => __menuLocks.delete(menuId), ttlMs);
+    __menuLocks.set(menuId, { consumed: true, timeoutId });
+    return true; // primeiro clique aceito
+  }
+
+  // Caso 2: já registrado mas ainda não consumido -> consome agora e renova TTL
+  if (!entry.consumed) {
+    if (entry.timeoutId) clearTimeout(entry.timeoutId);
+    const timeoutId = setTimeout(() => __menuLocks.delete(menuId), ttlMs);
+    __menuLocks.set(menuId, { consumed: true, timeoutId });
+    return true; // primeiro clique aceito
+  }
+
+  // Caso 3: já consumido -> clique repetido
+  return false;
 }
 
 function __splitMenuActionId(id) {
@@ -43,6 +50,8 @@ function __splitMenuActionId(id) {
   if (p === -1) return { menuId: null, actionId: id }; // retrocompat: id puro
   return { menuId: id.slice(0, p), actionId: id.slice(p + 1) };
 }
+/** ===== FIM BLOQUEIO ===== */
+
 
 /**
  * Utility Class to send and receive messages from WhatsApp.
@@ -163,45 +172,14 @@ class WhatsApp {
   async _createInteractiveMessage(userId, contactName, interactive) {
     switch (interactive.type) {
       case 'button_reply': {
-        const rawId = interactive.button_reply.id;
-        const newTitle = interactive.button_reply.title; // título do botão clicado agora
-        const { menuId, actionId } = __splitMenuActionId(rawId);
-
-        if (menuId) {
-          const st = __menuState.get(menuId);
-          if (!st || !st.consumed) {
-            // primeira escolha deste menu -> segue para ODA e guarda o título escolhido
-            __menuState.set(menuId, { consumed: true, firstTitle: newTitle });
-          } else {
-            // já houve escolha antes -> trata como "troca de assunto"
-            const previous = st.firstTitle || 'uma opção anterior';
-            const msg =
-              `Eu vi que você estava falando comigo referente a “${previous}”.\n` +
-              `Se quiser falar de “${newTitle}”, por favor selecione uma opção no menu abaixo.`;
-
-            // envia o texto informativo
-            this._sendToWhatsApp({
-              messaging_product: 'whatsapp',
-              preview_url: false,
-              recipient_type: 'individual',
-              to: userId,
-              type: 'text',
-              text: { body: msg }
-            });
-
-            // reenvia o ÚLTIMO MENU enviado a esse usuário (lista ou botões)
-            const lastMenu = __lastMenuByUser.get(userId) || __getMenu(menuId);
-            if (lastMenu) this._sendToWhatsApp(lastMenu);
-
-            return null; // não manda nada pro ODA
-          }
-        }
-
+        // NOVO: consome o lock e envia actionId limpo
+        const { menuId, actionId } = __splitMenuActionId(interactive.button_reply.id);
+        if (menuId && !__consumeMenuLock(menuId)) return null; // clique repetido => ignora
         return {
           userId,
           messagePayload: {
             type: 'postback',
-            postback: { action: actionId }, // id limpo para o ODA
+            postback: { action: actionId },
             channelExtensions: this._channelExtensions(userId, contactName)
           },
           profile: { whatsAppNumber: userId, contactName }
@@ -209,36 +187,9 @@ class WhatsApp {
       }
 
       case 'list_reply': {
-        const rawId = interactive.list_reply.id;
-        const newTitle = interactive.list_reply.title; // título do item clicado agora
-        const { menuId, actionId } = __splitMenuActionId(rawId);
-
-        if (menuId) {
-          const st = __menuState.get(menuId);
-          if (!st || !st.consumed) {
-            __menuState.set(menuId, { consumed: true, firstTitle: newTitle });
-          } else {
-            const previous = st.firstTitle || 'uma opção anterior';
-            const msg =
-              `Eu vi que você estava falando comigo referente a “${previous}”.\n` +
-              `Se quiser falar de “${newTitle}”, por favor selecione uma opção no menu abaixo.`;
-
-            this._sendToWhatsApp({
-              messaging_product: 'whatsapp',
-              preview_url: false,
-              recipient_type: 'individual',
-              to: userId,
-              type: 'text',
-              text: { body: msg }
-            });
-
-            const lastMenu = __lastMenuByUser.get(userId) || __getMenu(menuId);
-            if (lastMenu) this._sendToWhatsApp(lastMenu);
-
-            return null;
-          }
-        }
-
+        // NOVO: consome o lock e envia actionId limpo
+        const { menuId, actionId } = __splitMenuActionId(interactive.list_reply.id);
+        if (menuId && !__consumeMenuLock(menuId)) return null; // clique repetido => ignora
         return {
           userId,
           messagePayload: {
@@ -333,7 +284,7 @@ class WhatsApp {
     } else if (this._isCardMessage(type, messagePayload.cards)) {
       await this._handleCardMessage(messagePayload.cards, globalActions, headerText, footerText, data);
     } else if (this._isAttachmentMessage(type, messagePayload.attachment)) {
-      await this._handleAttachmentMessage(messagePayload.attachment, data);
+      await this._handleAttachmentMessage(messagePayload.attachment, data); // definido abaixo
     } else {
       return;
     }
@@ -380,21 +331,19 @@ class WhatsApp {
       action: { buttons: [] }
     };
 
-    // gera um menuId e prefixa os IDs dos botões
+    // NOVO: cria menuId e ativa lock de 60s
     const __menuId = __createMenuId();
+    __setMenuLock(__menuId);
 
     actions && actions.forEach(action => {
       data.interactive.action.buttons.push({
         type: 'reply',
         reply: {
-          id: `${__menuId}|${action.postback.action}`,
+          id: `${__menuId}|${action.postback.action}`, // prefixo do menu
           title: action.label.length < 21 ? action.label : action.label.substr(0, 16).concat('...')
         }
       });
     });
-
-    // memoriza o menu para possível reenvio
-    __rememberMenu(__menuId, data);
 
     if (image) {
       data.interactive.header = { type: 'image', image: { link: image } };
@@ -413,20 +362,19 @@ class WhatsApp {
       action: { button: 'Escolha uma opção', sections: [] }
     };
 
+    // NOVO: cria menuId e ativa lock de 60s
     const __menuId = __createMenuId();
+    __setMenuLock(__menuId);
 
     const rows = [];
     actions && actions.forEach(action => {
       rows.push({
-        id: `${__menuId}|${action.postback.action}`,
+        id: `${__menuId}|${action.postback.action}`, // prefixo do menu
         title: action.label.length < 24 ? action.label : action.label.substr(0, 20).concat('...')
       });
     });
 
     data.interactive.action.sections.push({ rows });
-
-    // memoriza o menu para possível reenvio
-    __rememberMenu(__menuId, data);
 
     if (image) {
       data.interactive.header = { type: 'image', image: { link: image } };
@@ -606,17 +554,7 @@ class WhatsApp {
     }
   }
 
-  // Enfileira o envio para o WhatsApp.
-  // Aqui também registramos o ÚLTIMO MENU por usuário para possibilitar reenvio.
   _sendToWhatsApp(message) {
-    try {
-      if (message && message.type === 'interactive' && message.to) {
-        const cloned = JSON.parse(JSON.stringify(message));
-        __lastMenuByUser.set(message.to, cloned);
-      }
-    } catch (e) {
-      logger.warn('Falha ao armazenar último menu por usuário:', e?.message || e);
-    }
     this.whatsAppSender._queueMessage(message);
   }
 }
