@@ -3,55 +3,62 @@ const WhatsAppSender = require('./whatsAppSender');
 const _ = require('underscore');
 const { MessageModel } = require('@oracle/bots-node-sdk/lib');
 const log4js = require('log4js');
-const axios = require('axios'); // usado no envio (upload opcional para media_id)
+const axios = require('axios');
 let logger = log4js.getLogger('WhatsApp');
 const Config = require('../../config/Config');
 logger.level = Config.LOG_LEVEL;
 
-const __menuLocks = new Map(); // menuId -> { consumed: boolean, timeoutId: Timeout }
+/* =========================================================================
+ *  CONTEXTO / ESTADO (sem trava de 60s)
+ *    - menuId: identifica cliques do MESMO menu (ids com prefixo "menuId|action")
+ *    - __menus: guarda o payload do menuId (pra reenvio fiel)
+ *    - __menuState: registra se já houve 1ª escolha e qual foi o título clicado
+ *    - __lastMenuByUser: SEMPRE guarda o ÚLTIMO menu enviado ao usuário
+ *    - __seenMsgs: dedupe de message.id (evita processar retries)
+ *    - __notifyThrottle: cooldown por menuId p/ não avisar infinitas vezes
+ * ========================================================================= */
+const __menus = new Map();               // menuId -> { dataClonado }
+const __menuState = new Map();           // menuId -> { consumed: boolean, firstTitle?: string }
+const __lastMenuByUser = new Map();      // userId -> dataClonado (último menu enviado)
+const __seenMsgs = new Map();            // messageId -> Timeout (TTL 2min)
+const __notifyThrottle = new Map();      // menuId -> Timeout (TTL curto para anti-loop)
 
-
+/* =============== helpers de ids/coleções =============== */
 function __createMenuId() {
   return `menu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
 }
-
-function __setMenuLock(menuId, ttlMs = 60 * 1000) { // opcional (pré-registro no envio)
-  const old = __menuLocks.get(menuId);
-  if (old?.timeoutId) clearTimeout(old.timeoutId);
-  const timeoutId = setTimeout(() => __menuLocks.delete(menuId), ttlMs);
-  __menuLocks.set(menuId, { consumed: false, timeoutId });
-}
-
-// Consome o lock de forma tolerante: aceita o primeiro clique mesmo que não tenha havido __setMenuLock antes.
-function __consumeMenuLock(menuId, ttlMs = 60 * 1000) {
-  const entry = __menuLocks.get(menuId);
-
-  // Caso 1: nunca vimos esse menuId -> aceita e cria registro como consumido
-  if (!entry) {
-    const timeoutId = setTimeout(() => __menuLocks.delete(menuId), ttlMs);
-    __menuLocks.set(menuId, { consumed: true, timeoutId });
-    return true; // primeiro clique aceito
+function __rememberMenu(menuId, data) {
+  try {
+    const cloned = JSON.parse(JSON.stringify(data));
+    __menus.set(menuId, { data: cloned });
+  } catch (e) {
+    logger.warn('Falha ao armazenar menu para reenvio:', e?.message || e);
   }
-
-  // Caso 2: já registrado mas ainda não consumido -> consome agora e renova TTL
-  if (!entry.consumed) {
-    if (entry.timeoutId) clearTimeout(entry.timeoutId);
-    const timeoutId = setTimeout(() => __menuLocks.delete(menuId), ttlMs);
-    __menuLocks.set(menuId, { consumed: true, timeoutId });
-    return true; // primeiro clique aceito
-  }
-
-  // Caso 3: já consumido -> clique repetido
-  return false;
 }
-
+function __getMenu(menuId) {
+  const found = __menus.get(menuId);
+  return found ? found.data : null;
+}
 function __splitMenuActionId(id) {
   const p = id.indexOf('|');
   if (p === -1) return { menuId: null, actionId: id }; // retrocompat: id puro
   return { menuId: id.slice(0, p), actionId: id.slice(p + 1) };
 }
-/** ===== FIM BLOQUEIO ===== */
-
+/* dedupe de eventos: processa cada message.id apenas 1x por 2min */
+function __seenOnce(messageId, ttlMs = 120000) {
+  if (!messageId) return true; // se por algum motivo não veio id, processa
+  if (__seenMsgs.has(messageId)) return false;
+  const t = setTimeout(() => __seenMsgs.delete(messageId), ttlMs);
+  __seenMsgs.set(messageId, t);
+  return true;
+}
+/* throttle: permite executar 1x por janela (anti-loop) */
+function __throttleOnce(map, key, ttlMs) {
+  if (map.has(key)) return false;
+  const t = setTimeout(() => map.delete(key), ttlMs);
+  map.set(key, t);
+  return true;
+}
 
 /**
  * Utility Class to send and receive messages from WhatsApp.
@@ -61,32 +68,22 @@ class WhatsApp {
     this.whatsAppSender = new WhatsAppSender();
   }
 
-  /**
-   * Receives a message from WhatsApp and convert to ODA payload
-   * @param {object[]} payload - WhatsApp webhook "entry" array
-   * @returns {object[]} array de mensagens no formato do ODA
-   */
+  /** Recebe a entrada do WhatsApp e converte pra payload do ODA */
   async _receive(payload) {
     return this._getWhatsAppMessages(payload);
   }
 
-  /**
-   * Helper: channelExtensions usados pelo ODA para manter a mesma conversa
-   */
+  /** channelExtensions usados pelo ODA p/ manter a conversa */
   _channelExtensions(userId, contactName) {
     return {
       source: 'whatsapp',
-      conversationKey: userId,     // <- chave estável da conversa
+      conversationKey: userId,
       externalUserId: userId,
       externalUserName: contactName || undefined
     };
   }
 
-  /**
-   * Process WhatsApp messages and convert to ODA message format.
-   * @param {object[]} payload - Whatsapp Messages array to be processed.
-   * @returns {object[]} Array de mensagens do ODA
-   */
+  /** Processa a entrada do WhatsApp em mensagens do ODA */
   async _getWhatsAppMessages(payload) {
     const odaMessages = [];
     const entries = payload || [];
@@ -96,13 +93,19 @@ class WhatsApp {
       for (const change of changes) {
         if (!change.value || !change.value.messages) continue;
 
-        logger.info('Message: ', JSON.stringify(change.value.messages));
+        logger.debug('Message: ', JSON.stringify(change.value.messages));
 
         const messages = change.value.messages;
         const userId = (change.value.contacts && change.value.contacts[0]?.wa_id) || '';
         const contactName = (change.value.contacts && change.value.contacts[0]?.profile?.name) || '';
 
         for (const message of messages) {
+          // 1) DEDUPE: ignora retries do mesmo evento
+          if (!__seenOnce(message.id)) {
+            logger.debug('Duplicated message id (retry) ignored:', message.id);
+            continue;
+          }
+
           const odaMessage = await this._processMessage(message, userId, contactName);
           if (odaMessage) odaMessages.push(odaMessage);
         }
@@ -111,9 +114,7 @@ class WhatsApp {
     return odaMessages;
   }
 
-  /**
-   * Converte cada mensagem de WhatsApp para o formato do ODA
-   */
+  /** Converte cada mensagem para o formato do ODA */
   async _processMessage(message, userId, contactName) {
     let odaMessage = null;
 
@@ -123,7 +124,7 @@ class WhatsApp {
         break;
 
       case 'interactive':
-        odaMessage = await this._createInteractiveMessage(userId, contactName, message.interactive);
+        odaMessage = await this._createInteractiveMessage(userId, contactName, message.interactive, message.id);
         break;
 
       case 'location':
@@ -154,9 +155,7 @@ class WhatsApp {
     return odaMessage;
   }
 
-  /** --------------------------
-   *    BUILDERS DE MENSAGEM
-   *  -------------------------- */
+  /* ---------- builders ---------- */
 
   _createTextMessage(userId, contactName, body) {
     return {
@@ -169,17 +168,47 @@ class WhatsApp {
     };
   }
 
-  async _createInteractiveMessage(userId, contactName, interactive) {
+  async _createInteractiveMessage(userId, contactName, interactive, messageId) {
     switch (interactive.type) {
       case 'button_reply': {
-        // NOVO: consome o lock e envia actionId limpo
-        const { menuId, actionId } = __splitMenuActionId(interactive.button_reply.id);
-        if (menuId && !__consumeMenuLock(menuId)) return null; // clique repetido => ignora
+        const rawId = interactive.button_reply.id;
+        const newTitle = interactive.button_reply.title;
+        const { menuId, actionId } = __splitMenuActionId(rawId);
+
+        if (menuId) {
+          const st = __menuState.get(menuId);
+          if (!st || !st.consumed) {
+            // 1ª escolha deste menu -> segue p/ ODA e guarda o título escolhido
+            __menuState.set(menuId, { consumed: true, firstTitle: newTitle });
+          } else {
+            // troca de opção no MESMO menu → avisa e reenvia menu (anti-loop)
+            const previous = st.firstTitle || 'uma opção anterior';
+            const msg = `Eu vi que você estava falando comigo referente a “${previous}”.\n` +
+                        `Se quiser falar de “${newTitle}”, por favor selecione uma opção no menu abaixo.`;
+
+            // cooldown por menuId (4s) para segurar retries/loop
+            if (__throttleOnce(__notifyThrottle, menuId, 4000)) {
+              this._sendToWhatsApp({
+                messaging_product: 'whatsapp',
+                preview_url: false,
+                recipient_type: 'individual',
+                to: userId,
+                type: 'text',
+                text: { body: msg }
+              });
+
+              const lastMenu = __lastMenuByUser.get(userId) || __getMenu(menuId);
+              if (lastMenu) this._sendToWhatsApp(lastMenu);
+            }
+            return null; // não encaminha pro ODA
+          }
+        }
+
         return {
           userId,
           messagePayload: {
             type: 'postback',
-            postback: { action: actionId },
+            postback: { action: actionId }, // id limpo pro ODA
             channelExtensions: this._channelExtensions(userId, contactName)
           },
           profile: { whatsAppNumber: userId, contactName }
@@ -187,9 +216,36 @@ class WhatsApp {
       }
 
       case 'list_reply': {
-        // NOVO: consome o lock e envia actionId limpo
-        const { menuId, actionId } = __splitMenuActionId(interactive.list_reply.id);
-        if (menuId && !__consumeMenuLock(menuId)) return null; // clique repetido => ignora
+        const rawId = interactive.list_reply.id;
+        const newTitle = interactive.list_reply.title;
+        const { menuId, actionId } = __splitMenuActionId(rawId);
+
+        if (menuId) {
+          const st = __menuState.get(menuId);
+          if (!st || !st.consumed) {
+            __menuState.set(menuId, { consumed: true, firstTitle: newTitle });
+          } else {
+            const previous = st.firstTitle || 'uma opção anterior';
+            const msg = `Eu vi que você estava falando comigo referente a “${previous}”.\n` +
+                        `Se quiser falar de “${newTitle}”, por favor selecione uma opção no menu abaixo.`;
+
+            if (__throttleOnce(__notifyThrottle, menuId, 4000)) {
+              this._sendToWhatsApp({
+                messaging_product: 'whatsapp',
+                preview_url: false,
+                recipient_type: 'individual',
+                to: userId,
+                type: 'text',
+                text: { body: msg }
+              });
+
+              const lastMenu = __lastMenuByUser.get(userId) || __getMenu(menuId);
+              if (lastMenu) this._sendToWhatsApp(lastMenu);
+            }
+            return null;
+          }
+        }
+
         return {
           userId,
           messagePayload: {
@@ -219,11 +275,7 @@ class WhatsApp {
     };
   }
 
-  /**
-   * ENTRADA: Recebe mídia do WhatsApp e envia ao ODA como ATTACHMENT (image/audio/video/file)
-   * - Baixa mídia via Graph (usando attachment.id)
-   * - Sobe no S3 e gera URL assinada
-   */
+  /** Entrada de mídia: baixa da Meta e sobe p/ S3 (ou envia por link) */
   async _createAttachmentMessage(userId, contactName, attachment, type) {
     const fileUrl = await this.whatsAppSender._downloadAndSaveWhatsAppAttachmentMessage(attachment);
     if (!fileUrl) {
@@ -240,19 +292,14 @@ class WhatsApp {
       default:         odaAttachmentType = 'file';
     }
 
-    // título (caption/filename) – útil para PDF/arquivo; áudio PTT pode não ter filename
     let title = attachment.caption || attachment.filename || undefined;
-    if (!title && type === 'audio') title = 'audio.ogg'; // default amigável para PTT
+    if (!title && type === 'audio') title = 'audio.ogg';
 
     const odaMsg = {
       userId,
       messagePayload: {
         type: 'attachment',
-        attachment: {
-          type: odaAttachmentType, // image | audio | video | file
-          url: fileUrl,            // URL assinada do S3
-          title                    // opcional
-        },
+        attachment: { type: odaAttachmentType, url: fileUrl, title },
         channelExtensions: this._channelExtensions(userId, contactName)
       },
       profile: { whatsAppNumber: userId, contactName }
@@ -262,9 +309,7 @@ class WhatsApp {
     return odaMsg;
   }
 
-  /** --------------------------
-   *      SAÍDA PARA WHATSAPP
-   *  -------------------------- */
+  /* ---------- SAÍDA p/ WhatsApp ---------- */
 
   async _send(payload) {
     const { userId, messagePayload } = payload;
@@ -284,7 +329,7 @@ class WhatsApp {
     } else if (this._isCardMessage(type, messagePayload.cards)) {
       await this._handleCardMessage(messagePayload.cards, globalActions, headerText, footerText, data);
     } else if (this._isAttachmentMessage(type, messagePayload.attachment)) {
-      await this._handleAttachmentMessage(messagePayload.attachment, data); // definido abaixo
+      await this._handleAttachmentMessage(messagePayload.attachment, data);
     } else {
       return;
     }
@@ -331,19 +376,19 @@ class WhatsApp {
       action: { buttons: [] }
     };
 
-    // NOVO: cria menuId e ativa lock de 60s
     const __menuId = __createMenuId();
-    __setMenuLock(__menuId);
 
     actions && actions.forEach(action => {
       data.interactive.action.buttons.push({
         type: 'reply',
         reply: {
-          id: `${__menuId}|${action.postback.action}`, // prefixo do menu
+          id: `${__menuId}|${action.postback.action}`,
           title: action.label.length < 21 ? action.label : action.label.substr(0, 16).concat('...')
         }
       });
     });
+
+    __rememberMenu(__menuId, data); // menu para reenvio
 
     if (image) {
       data.interactive.header = { type: 'image', image: { link: image } };
@@ -362,19 +407,19 @@ class WhatsApp {
       action: { button: 'Escolha uma opção', sections: [] }
     };
 
-    // NOVO: cria menuId e ativa lock de 60s
     const __menuId = __createMenuId();
-    __setMenuLock(__menuId);
 
     const rows = [];
     actions && actions.forEach(action => {
       rows.push({
-        id: `${__menuId}|${action.postback.action}`, // prefixo do menu
+        id: `${__menuId}|${action.postback.action}`,
         title: action.label.length < 24 ? action.label : action.label.substr(0, 20).concat('...')
       });
     });
 
     data.interactive.action.sections.push({ rows });
+
+    __rememberMenu(__menuId, data); // menu para reenvio
 
     if (image) {
       data.interactive.header = { type: 'image', image: { link: image } };
@@ -478,8 +523,7 @@ class WhatsApp {
 
   /**
    * SAÍDA (ODA->WhatsApp): envia attachment.
-   * - Por padrão usa LINK (compatível com seu código atual).
-   * - Se WHATSAPP_UPLOAD_MEDIA=true e existir this.whatsAppSender._uploadToWhatsAppMedia, faz upload pro WhatsApp e envia por media_id.
+   * Usa link (padrão) ou upload nativo (media_id) se habilitado.
    */
   async _handleAttachmentMessage(attachment, data) {
     const { type, url, title } = attachment || {};
@@ -488,17 +532,14 @@ class WhatsApp {
       return;
     }
 
-    // Upload opcional para media_id (feature flag + método disponível)
     const wantUpload = String(process.env.WHATSAPP_UPLOAD_MEDIA || '').toLowerCase() === 'true';
     const canUpload = typeof this.whatsAppSender._uploadToWhatsAppMedia === 'function';
 
     if (wantUpload && canUpload) {
       try {
-        // baixa a mídia a partir da URL do ODA
         const res = await axios.get(url, { responseType: 'arraybuffer' });
         const buffer = Buffer.from(res.data);
         const mimeType = res.headers['content-type'] || 'application/octet-stream';
-
         const mediaId = await this.whatsAppSender._uploadToWhatsAppMedia(buffer, mimeType);
         logger.info(`[ODA->WA] Enviando ${type} por media_id`);
 
@@ -517,7 +558,7 @@ class WhatsApp {
             data.type = 'audio';
             data.audio = { id: mediaId };
             return;
-          default: // 'file' | 'document'
+          default:
             data.type = 'document';
             data.document = { id: mediaId };
             if (title) data.document.caption = title;
@@ -525,11 +566,9 @@ class WhatsApp {
         }
       } catch (e) {
         logger.error('Falha no upload para media_id, usando fallback por link:', e?.message || e);
-        // segue para fallback por link
       }
     }
 
-    // Fallback padrão por LINK (comportamento original)
     logger.info(`[ODA->WA] Enviando ${type} por link`);
     switch (type) {
       case 'image':
@@ -546,7 +585,7 @@ class WhatsApp {
         data.type = 'audio';
         data.audio = { link: url };
         break;
-      default: // 'file' | 'document'
+      default:
         data.type = 'document';
         data.document = { link: url };
         if (title) data.document.caption = title;
@@ -554,7 +593,16 @@ class WhatsApp {
     }
   }
 
+  // Enfileira o envio; se for menu (interactive), guarda o ÚLTIMO por usuário
   _sendToWhatsApp(message) {
+    try {
+      if (message && message.type === 'interactive' && message.to) {
+        const cloned = JSON.parse(JSON.stringify(message));
+        __lastMenuByUser.set(message.to, cloned);
+      }
+    } catch (e) {
+      logger.warn('Falha ao armazenar último menu por usuário:', e?.message || e);
+    }
     this.whatsAppSender._queueMessage(message);
   }
 }
