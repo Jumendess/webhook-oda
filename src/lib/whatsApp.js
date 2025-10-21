@@ -8,6 +8,32 @@ let logger = log4js.getLogger('WhatsApp');
 const Config = require('../../config/Config');
 logger.level = Config.LOG_LEVEL;
 
+/** ===== BLOQUEIO DE MENUS INTERATIVOS (idempotência) ===== */
+const __menuLocks = new Map(); // menuId -> timeoutId
+
+function __createMenuId() {
+  return `menu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
+}
+function __setMenuLock(menuId, ttlMs = 60 * 1000) { // 1 minuto
+  if (__menuLocks.has(menuId)) return;
+  const t = setTimeout(() => __menuLocks.delete(menuId), ttlMs);
+  __menuLocks.set(menuId, t);
+}
+function __consumeMenuLock(menuId) {
+  const t = __menuLocks.get(menuId);
+  if (!t) return false;            // se não existe, já consumiu/expirou
+  clearTimeout(t);
+  __menuLocks.delete(menuId);
+  return true;                     // primeira vez (consumido agora)
+}
+function __splitMenuActionId(id) {
+  const p = id.indexOf('|');
+  if (p === -1) return { menuId: null, actionId: id };   // retrocompat: id puro
+  return { menuId: id.slice(0, p), actionId: id.slice(p+1) };
+}
+/** ===== FIM BLOQUEIO ===== */
+
+
 /**
  * Utility Class to send and receive messages from WhatsApp.
  */
@@ -126,27 +152,35 @@ class WhatsApp {
 
   async _createInteractiveMessage(userId, contactName, interactive) {
     switch (interactive.type) {
-      case 'button_reply':
+      case 'button_reply': {
+        // NOVO: consome o lock e envia actionId limpo
+        const { menuId, actionId } = __splitMenuActionId(interactive.button_reply.id);
+        if (menuId && !__consumeMenuLock(menuId)) return null; // clique repetido => ignora
         return {
           userId,
           messagePayload: {
             type: 'postback',
-            postback: { action: interactive.button_reply.id },
+            postback: { action: actionId },
             channelExtensions: this._channelExtensions(userId, contactName)
           },
           profile: { whatsAppNumber: userId, contactName }
         };
+      }
 
-      case 'list_reply':
+      case 'list_reply': {
+        // NOVO: consome o lock e envia actionId limpo
+        const { menuId, actionId } = __splitMenuActionId(interactive.list_reply.id);
+        if (menuId && !__consumeMenuLock(menuId)) return null; // clique repetido => ignora
         return {
           userId,
           messagePayload: {
             type: 'postback',
-            postback: { action: interactive.list_reply.id },
+            postback: { action: actionId },
             channelExtensions: this._channelExtensions(userId, contactName)
           },
           profile: { whatsAppNumber: userId, contactName }
         };
+      }
 
       default:
         logger.warn('Unsupported interactive type:', interactive.type);
@@ -278,11 +312,15 @@ class WhatsApp {
       action: { buttons: [] }
     };
 
+    // NOVO: cria menuId e ativa lock de 60s
+    const __menuId = __createMenuId();
+    __setMenuLock(__menuId);
+
     actions && actions.forEach(action => {
       data.interactive.action.buttons.push({
         type: 'reply',
         reply: {
-          id: action.postback.action,
+          id: `${__menuId}|${action.postback.action}`, // prefixo do menu
           title: action.label.length < 21 ? action.label : action.label.substr(0, 16).concat('...')
         }
       });
@@ -305,10 +343,14 @@ class WhatsApp {
       action: { button: 'Escolha uma opção', sections: [] }
     };
 
+    // NOVO: cria menuId e ativa lock de 60s
+    const __menuId = __createMenuId();
+    __setMenuLock(__menuId);
+
     const rows = [];
     actions && actions.forEach(action => {
       rows.push({
-        id: action.postback.action,
+        id: `${__menuId}|${action.postback.action}`, // prefixo do menu
         title: action.label.length < 24 ? action.label : action.label.substr(0, 20).concat('...')
       });
     });
