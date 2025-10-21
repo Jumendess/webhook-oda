@@ -8,28 +8,46 @@ let logger = log4js.getLogger('WhatsApp');
 const Config = require('../../config/Config');
 logger.level = Config.LOG_LEVEL;
 
-/** ===== BLOQUEIO DE MENUS INTERATIVOS (idempotência) ===== */
-const __menuLocks = new Map(); // menuId -> timeoutId
+const __menuLocks = new Map(); // menuId -> { consumed: boolean, timeoutId: Timeout }
 
 function __createMenuId() {
   return `menu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
 }
-function __setMenuLock(menuId, ttlMs = 60 * 1000) { // 1 minuto
-  if (__menuLocks.has(menuId)) return;
-  const t = setTimeout(() => __menuLocks.delete(menuId), ttlMs);
-  __menuLocks.set(menuId, t);
+
+function __setMenuLock(menuId, ttlMs = 60 * 1000) { // opcional (pré-registro no envio)
+  const old = __menuLocks.get(menuId);
+  if (old?.timeoutId) clearTimeout(old.timeoutId);
+  const timeoutId = setTimeout(() => __menuLocks.delete(menuId), ttlMs);
+  __menuLocks.set(menuId, { consumed: false, timeoutId });
 }
-function __consumeMenuLock(menuId) {
-  const t = __menuLocks.get(menuId);
-  if (!t) return false;            // se não existe, já consumiu/expirou
-  clearTimeout(t);
-  __menuLocks.delete(menuId);
-  return true;                     // primeira vez (consumido agora)
+
+// Consome o lock de forma tolerante: aceita o primeiro clique mesmo que não tenha havido __setMenuLock antes.
+function __consumeMenuLock(menuId, ttlMs = 60 * 1000) {
+  const entry = __menuLocks.get(menuId);
+
+  // Caso 1: nunca vimos esse menuId -> aceita e cria registro como consumido
+  if (!entry) {
+    const timeoutId = setTimeout(() => __menuLocks.delete(menuId), ttlMs);
+    __menuLocks.set(menuId, { consumed: true, timeoutId });
+    return true; // primeiro clique aceito
+  }
+
+  // Caso 2: já registrado mas ainda não consumido -> consome agora e renova TTL
+  if (!entry.consumed) {
+    if (entry.timeoutId) clearTimeout(entry.timeoutId);
+    const timeoutId = setTimeout(() => __menuLocks.delete(menuId), ttlMs);
+    __menuLocks.set(menuId, { consumed: true, timeoutId });
+    return true; // primeiro clique aceito
+  }
+
+  // Caso 3: já consumido -> clique repetido
+  return false;
 }
+
 function __splitMenuActionId(id) {
   const p = id.indexOf('|');
-  if (p === -1) return { menuId: null, actionId: id };   // retrocompat: id puro
-  return { menuId: id.slice(0, p), actionId: id.slice(p+1) };
+  if (p === -1) return { menuId: null, actionId: id }; // retrocompat: id puro
+  return { menuId: id.slice(0, p), actionId: id.slice(p + 1) };
 }
 /** ===== FIM BLOQUEIO ===== */
 
