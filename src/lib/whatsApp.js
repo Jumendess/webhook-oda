@@ -8,35 +8,6 @@ let logger = log4js.getLogger('WhatsApp');
 const Config = require('../../config/Config');
 logger.level = Config.LOG_LEVEL;
 
-
-/** ===== BLOQUEIO DE MENUS INTERATIVOS (idempotência) ===== */
-const __menuLocks = new Map(); // menuId -> timeoutId
-
-function __createMenuId() {
-  return `menu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
-}
-
-function __setMenuLock(menuId, ttlMs = 60 * 1000) { // 1 minuto
-  if (__menuLocks.has(menuId)) return;
-  const t = setTimeout(() => __menuLocks.delete(menuId), ttlMs);
-  __menuLocks.set(menuId, t);
-}
-
-function __consumeMenuLock(menuId) {
-  const t = __menuLocks.get(menuId);
-  if (!t) return false; // já consumido/expirado
-  clearTimeout(t);
-  __menuLocks.delete(menuId);
-  return true;
-}
-
-function __splitMenuActionId(id) {
-  const p = id.indexOf('|');
-  if (p === -1) return { menuId: null, actionId: id };
-  return { menuId: id.slice(0, p), actionId: id.slice(p+1) };
-}
-/** ===== FIM BLOQUEIO ===== */
-
 /**
  * Utility Class to send and receive messages from WhatsApp.
  */
@@ -153,49 +124,35 @@ class WhatsApp {
     };
   }
 
-  // Substitua TUDO que há hoje na função por este conteúdo:
-async _createInteractiveMessage(userId, contactName, interactive) {
-  switch (interactive.type) {
-    case 'button_reply': {
-      const { menuId, actionId } = __splitMenuActionId(interactive.button_reply.id);
-      // se já respondeu este menu, ignore silenciosamente
-      if (menuId && !__consumeMenuLock(menuId)) return null;
+  async _createInteractiveMessage(userId, contactName, interactive) {
+    switch (interactive.type) {
+      case 'button_reply':
+        return {
+          userId,
+          messagePayload: {
+            type: 'postback',
+            postback: { action: interactive.button_reply.id },
+            channelExtensions: this._channelExtensions(userId, contactName)
+          },
+          profile: { whatsAppNumber: userId, contactName }
+        };
 
-      return {
-        userId,
-        messagePayload: {
-          type: 'postback',
-          postback: { action: actionId },
-          channelExtensions: this._channelExtensions(userId, contactName)
-        },
-        profile: { whatsAppNumber: userId, contactName }
-      };
-    }
+      case 'list_reply':
+        return {
+          userId,
+          messagePayload: {
+            type: 'postback',
+            postback: { action: interactive.list_reply.id },
+            channelExtensions: this._channelExtensions(userId, contactName)
+          },
+          profile: { whatsAppNumber: userId, contactName }
+        };
 
-    case 'list_reply': {
-      const { menuId, actionId } = __splitMenuActionId(interactive.list_reply.id);
-      // se já respondeu este menu, ignore silenciosamente
-      if (menuId && !__consumeMenuLock(menuId)) return null;
-
-      return {
-        userId,
-        messagePayload: {
-          type: 'postback',
-          postback: { action: actionId },
-          channelExtensions: this._channelExtensions(userId, contactName)
-        },
-        profile: { whatsAppNumber: userId, contactName }
-      };
-    }
-
-    default: {
-      logger.warn('Unsupported interactive type:', interactive.type);
-      return null;
+      default:
+        logger.warn('Unsupported interactive type:', interactive.type);
+        return null;
     }
   }
-}
-
-  
 
   _createLocationMessage(userId, contactName, location) {
     return {
@@ -325,7 +282,7 @@ async _createInteractiveMessage(userId, contactName, interactive) {
       data.interactive.action.buttons.push({
         type: 'reply',
         reply: {
-          id: `${__menuId}|${action.postback.action}`,
+          id: action.postback.action,
           title: action.label.length < 21 ? action.label : action.label.substr(0, 16).concat('...')
         }
       });
@@ -351,7 +308,7 @@ async _createInteractiveMessage(userId, contactName, interactive) {
     const rows = [];
     actions && actions.forEach(action => {
       rows.push({
-        id: `${__menuId}|${action.postback.action}`,
+        id: action.postback.action,
         title: action.label.length < 24 ? action.label : action.label.substr(0, 20).concat('...')
       });
     });
