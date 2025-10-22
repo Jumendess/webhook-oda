@@ -1,216 +1,114 @@
-````markdown
-# ODA WhatsApp Integration
+🧠 Visão Geral do Projeto
 
-Este projeto integra o Oracle Digital Assistant (ODA) com o WhatsApp, permitindo a comunicação com usuários através de um chatbot no WhatsApp. A integração utiliza a API do WhatsApp e um servidor Node.js para gerenciar as mensagens e as interações com o ODA.
+Este projeto implementa um conector inteligente entre o Oracle Digital Assistant (ODA) e a WhatsApp Cloud API (Meta), permitindo a comunicação bidirecional entre assistentes virtuais da Oracle e usuários finais no WhatsApp.
 
-## Funcionalidades
+A solução foi desenvolvida em Node.js, com Express como servidor HTTP e integração completa com a API Graph do WhatsApp, suportando o envio e recebimento de mensagens, botões interativos, listas, mídias e documentos.
+Além disso, conta com suporte nativo a armazenamento de anexos no AWS S3, gerando URLs temporárias assinadas para que o ODA consiga acessar arquivos de forma segura.
 
-- Envio e recebimento de mensagens via WhatsApp.
-- Integração com o Oracle Digital Assistant (ODA).
-- Suporte a interações como botões e listas interativas no WhatsApp.
-- Configuração fácil de variáveis de ambiente e integração com o ODA.
+⚙️ Objetivo
 
-## Arquitetura
+O principal objetivo é permitir que qualquer assistente criado no Oracle Digital Assistant possa conversar com usuários do WhatsApp em tempo real, com a mesma experiência oferecida nos canais nativos da Oracle.
+Isso inclui:
 
-- **Servidor Node.js**: O servidor é responsável por lidar com as requisições de mensagens, comunicar-se com a API do WhatsApp e o Oracle Digital Assistant.
-- **WhatsApp API**: A comunicação com o WhatsApp é feita através da API do WhatsApp.
-- **Oracle Digital Assistant**: O ODA é utilizado para gerenciar as interações e lógica de conversa.
+Envio e recebimento de mensagens de texto e mídia.
 
-## Como Funciona
+Renderização de botões e menus interativos.
 
-1. O servidor Node.js recebe a mensagem do WhatsApp.
-2. A mensagem é enviada para o Oracle Digital Assistant (ODA) para processamento.
-3. O ODA responde com uma mensagem, que é enviada de volta ao usuário via WhatsApp.
-4. O servidor também pode responder com botões interativos ou listas, e capturar ações do usuário.
+Sincronização de contexto e estado entre as plataformas.
 
-## Pré-requisitos
+Armazenamento de arquivos em nuvem com controle de expiração.
 
-Antes de rodar o projeto, certifique-se de ter o seguinte:
+Em resumo, trata-se de um middleware universal entre o ODA e o WhatsApp, cuidando de toda a tradução de formatos e autenticação entre os dois sistemas.
 
-- **Node.js** (versão 14.x ou superior)
-- **NPM** (ou Yarn)
-- **Conta no WhatsApp Business API** e credenciais da API
-- **Oracle Cloud Account** com ODA configurado
-- **Variáveis de ambiente configuradas** (detalhado abaixo)
+🔄 Como Funciona
 
-## Instalação
+O conector funciona em duas direções principais:
 
-Siga os passos abaixo para instalar e rodar o projeto localmente.
+Direção	Função	Endpoint	Descrição
+WhatsApp → ODA	Recepção de mensagens	POST /user/message	Recebe mensagens da Meta e converte para o formato do ODA
+ODA → WhatsApp	Envio de mensagens	POST /bot/message	Recebe mensagens do ODA e as transforma no formato aceito pela API do WhatsApp
+Verificação	Validação do webhook Meta	GET /user/message	Endpoint usado pelo painel do WhatsApp Cloud API para validar o webhook
+Status	Healthcheck	GET /	Retorna um status simples confirmando que o servidor está online
 
-### Passo 1: Clone o repositório
+Toda a comunicação é feita de forma assíncrona e confiável, utilizando filas internas para garantir que nenhuma mensagem seja perdida, mesmo em casos de latência na API do WhatsApp ou no ODA.
 
-Abra o terminal e execute o comando abaixo para clonar o repositório do projeto:
+💬 Recursos Implementados
+Entrada (WhatsApp → ODA)
 
-```bash
-git clone https://github.com/Jumendess/webhook_whatsApp_code.git
-```
-````
+Texto simples
 
-### Passo 2: Acesse o diretório do projeto
+Mensagens interativas (botões e listas)
 
-```bash
-cd webhook_whatsApp_code
-```
+Localização
 
-### Passo 3: Instale as dependências
+Mídias: imagens, vídeos, áudios e documentos
 
-Se você estiver usando o **NPM**, execute o seguinte comando para instalar as dependências:
+Lógica de deduplicação para evitar mensagens repetidas
 
-```bash
-npm install
-```
+Saída (ODA → WhatsApp)
 
-Ou, se preferir usar o **Yarn**, execute:
+Mensagens de texto e menus interativos
 
-```bash
-yarn install
-```
+Envio de mídias com upload via media_id ou link público
 
-### Passo 4: Configuração das Variáveis de Ambiente
+Gerenciamento de menus:
 
-Crie um arquivo `.env` na raiz do projeto com as seguintes variáveis:
+Evita múltiplos cliques no mesmo botão
 
-```env
-ODA_BOT_URL=<URL_DO_SEU_BOT_ODA>
-ODA_SECRET_KEY=<SUA_SECRET_KEY_DO_ODA>
-WHATSAPP_API_URL=<URL_DA_API_WHATSAPP>
-WHATSAPP_API_KEY=<SUA_CHAVE_API_WHATSAPP>
-```
+Reenvia automaticamente o último menu ativo
 
-- **ODA_BOT_URL**: URL do seu Oracle Digital Assistant.
-- **ODA_SECRET_KEY**: Chave secreta para autenticação no ODA.
-- **WHATSAPP_API_URL**: URL da API do WhatsApp Business.
-- **WHATSAPP_API_KEY**: Chave de acesso à API do WhatsApp.
+Mensagens dinâmicas com cabeçalhos e rodapés
 
-### Passo 5: Rodando o Projeto
+Armazenamento em Nuvem (opcional)
 
-Agora você está pronto para rodar o projeto!
+Upload de arquivos no AWS S3
 
-#### Para rodar o servidor em **desenvolvimento** (com monitoramento automático de alterações):
+Geração de URL assinada com tempo de expiração configurável
 
-```bash
-npm run start:dev
-```
+Download e upload automático de mídias recebidas via Graph API
 
-Ou, se preferir usar o **Yarn**:
+🧩 Arquitetura
 
-```bash
-yarn start:dev
-```
+A aplicação é composta por três camadas principais:
 
-#### Para rodar o servidor em **produção** (sem monitoramento):
+Servidor (server.js)
 
-```bash
-npm start
-```
+Responsável pelos endpoints de entrada e saída.
 
-Ou, com **Yarn**:
+Integra Express, OracleBot SDK e o cliente WhatsApp.
 
-```bash
-yarn start
-```
+Conector WhatsApp (whatsApp.js)
 
-O servidor vai iniciar e escutar na porta configurada no arquivo `.env`. Se você não configurar uma porta específica, o padrão será a porta `3000`.
+Interpreta mensagens do WhatsApp e converte para o formato do ODA.
 
-## Endpoints
+Gerencia menus interativos e controle de estado.
 
-### `/message`
+Sender (whatsAppSender.js)
 
-Este endpoint é responsável por receber as mensagens do WhatsApp e encaminhá-las para o ODA. O ODA processa a mensagem e retorna uma resposta para ser enviada ao usuário via WhatsApp.
+Lida com envio de mensagens e uploads de mídia.
 
-#### Requisição
+Utiliza fila interna e SDK da AWS para armazenar arquivos.
 
-```http
-POST /message
-Content-Type: application/json
+🧠 Benefícios Técnicos
 
-{
-  "userId": "whatsapp_number",
-  "message": "mensagem_recebida"
-}
-```
+Código modular e de fácil manutenção.
 
-#### Resposta
+Suporte completo à API do WhatsApp Cloud (Meta Graph).
 
-```json
-{
-  "response": "Resposta do ODA"
-}
-```
+Compatível com múltiplos canais do ODA.
 
-### Como Funciona o Fluxo de Mensagens
+Gerenciamento de anexos seguro via S3 (ou opcionalmente local).
 
-1. **Recepção da Mensagem**: Quando o usuário envia uma mensagem no WhatsApp, ela é recebida pelo endpoint `/message`.
-2. **Envio ao ODA**: A mensagem é enviada ao Oracle Digital Assistant (ODA) para processamento.
-3. **Resposta do ODA**: O ODA gera uma resposta com base na configuração do bot e envia de volta para o servidor.
-4. **Envio de Mensagem no WhatsApp**: A resposta gerada pelo ODA é enviada para o usuário via WhatsApp.
+Logs estruturados e configuráveis com log4js.
 
-## Interações Suportadas
+Facilidade para escalar ou dockerizar em ambientes de produção.
 
-### Botões
+🚀 Casos de Uso
 
-O projeto suporta botões interativos que permitem ao usuário escolher uma opção diretamente no WhatsApp. Exemplo de código para um botão:
+Chatbots corporativos no WhatsApp utilizando o ODA como cérebro conversacional.
 
-```json
-{
-  "type": "button",
-  "text": "Clique aqui",
-  "action": "opcao_1"
-}
-```
+Atendimento automatizado para vendas, suporte e triagem.
 
-### Listas
+Integrações empresariais com ERPs, CRMs e APIs internas via ODA.
 
-As listas são enviadas no formato de uma lista interativa, onde o usuário pode escolher uma opção. A estrutura seria algo como:
-
-```json
-{
-  "type": "list",
-  "text": "Escolha uma opção",
-  "options": [
-    {
-      "id": "opcao_1",
-      "label": "Opção 1"
-    },
-    {
-      "id": "opcao_2",
-      "label": "Opção 2"
-    }
-  ]
-}
-```
-
-## Contribuições
-
-Se você deseja contribuir com o projeto, siga os seguintes passos:
-
-1. Faça um fork deste repositório.
-2. Crie uma nova branch (`git checkout -b minha-branch`).
-3. Faça suas alterações.
-4. Commit suas alterações (`git commit -am 'Adicionando nova funcionalidade'`).
-5. Envie para o repositório remoto (`git push origin minha-branch`).
-6. Crie um pull request.
-
-## Licença
-
-Este projeto está licenciado sob a Licença MIT - veja o arquivo [LICENSE](LICENSE) para mais detalhes.
-
----
-
-### Autor
-
-Julio Mendes
-
-GitHub: [https://github.com/Jumendess/webhook_whatsApp_code](https://github.com/Jumendess/webhook_whatsApp_code)
-
-```
-
-### O que foi adicionado e modificado:
-
-- **Comandos para instalação e execução**: Todos os comandos necessários (clone, instalação, rodar o servidor) estão destacados com exemplos prontos para copiar.
-- **Passo a Passo**: Cada passo é numerado e fácil de seguir, com exemplos de comandos para copiar diretamente no terminal.
-- **Variáveis de Ambiente**: Explicação clara de como configurar as variáveis de ambiente com exemplos de valores.
-- **Rodando o Projeto**: Comandos para rodar o servidor em **desenvolvimento** e **produção**, com instruções claras para ambos os casos.
-
-
-```
+Automação de envio de documentos e coleta de arquivos via WhatsApp.
