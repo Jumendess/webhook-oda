@@ -12,16 +12,17 @@ logger.level = Config.LOG_LEVEL;
  *  CONTEXTO / ESTADO (sem trava de 60s)
  *    - menuId: identifica cliques do MESMO menu (ids com prefixo "menuId|action")
  *    - __menus: guarda o payload do menuId (pra reenvio fiel)
- *    - __menuState: registra se já houve 1ª escolha e qual foi o título clicado
+ *    - __menuState: { firstActionId, firstTitle, consumedAt, noticeSent }
  *    - __lastMenuByUser: SEMPRE guarda o ÚLTIMO menu enviado ao usuário
  *    - __seenMsgs: dedupe de message.id (evita processar retries)
- *    - __notifyThrottle: cooldown por menuId p/ não avisar infinitas vezes
  * ========================================================================= */
 const __menus = new Map();               // menuId -> { dataClonado }
-const __menuState = new Map();           // menuId -> { consumed: boolean, firstTitle?: string }
+const __menuState = new Map();           // menuId -> { firstActionId, firstTitle, consumedAt, noticeSent }
 const __lastMenuByUser = new Map();      // userId -> dataClonado (último menu enviado)
 const __seenMsgs = new Map();            // messageId -> Timeout (TTL 2min)
-const __notifyThrottle = new Map();      // menuId -> Timeout (TTL curto para anti-loop)
+
+/** Janela para enviar 1 (um) aviso por menu após a 1ª escolha */
+const NOTICE_WINDOW_MS = 60 * 1000;
 
 /* =============== helpers de ids/coleções =============== */
 function __createMenuId() {
@@ -50,13 +51,6 @@ function __seenOnce(messageId, ttlMs = 120000) {
   if (__seenMsgs.has(messageId)) return false;
   const t = setTimeout(() => __seenMsgs.delete(messageId), ttlMs);
   __seenMsgs.set(messageId, t);
-  return true;
-}
-/* throttle: permite executar 1x por janela (anti-loop) */
-function __throttleOnce(map, key, ttlMs) {
-  if (map.has(key)) return false;
-  const t = setTimeout(() => map.delete(key), ttlMs);
-  map.set(key, t);
   return true;
 }
 
@@ -124,7 +118,7 @@ class WhatsApp {
         break;
 
       case 'interactive':
-        odaMessage = await this._createInteractiveMessage(userId, contactName, message.interactive, message.id);
+        odaMessage = await this._createInteractiveMessage(userId, contactName, message.interactive);
         break;
 
       case 'location':
@@ -168,7 +162,7 @@ class WhatsApp {
     };
   }
 
-  async _createInteractiveMessage(userId, contactName, interactive, messageId) {
+  async _createInteractiveMessage(userId, contactName, interactive) {
     switch (interactive.type) {
       case 'button_reply': {
         const rawId = interactive.button_reply.id;
@@ -177,17 +171,29 @@ class WhatsApp {
 
         if (menuId) {
           const st = __menuState.get(menuId);
-          if (!st || !st.consumed) {
-            // 1ª escolha deste menu -> segue p/ ODA e guarda o título escolhido
-            __menuState.set(menuId, { consumed: true, firstTitle: newTitle });
-          } else {
-            // troca de opção no MESMO menu → avisa e reenvia menu (anti-loop)
-            const previous = st.firstTitle || 'uma opção anterior';
-            const msg = `Eu vi que você estava falando comigo referente a “${previous}”.\n` +
-                        `Se quiser falar de “${newTitle}”, por favor selecione uma opção no menu abaixo.`;
 
-            // cooldown por menuId (4s) para segurar retries/loop
-            if (__throttleOnce(__notifyThrottle, menuId, 4000)) {
+          // PRIMEIRA escolha deste menu -> registra e segue para o ODA
+          if (!st) {
+            __menuState.set(menuId, {
+              firstActionId: actionId,
+              firstTitle: newTitle,
+              consumedAt: Date.now(),
+              noticeSent: false
+            });
+          } else {
+            // Já houve 1ª escolha
+            const withinWindow = (Date.now() - st.consumedAt) <= NOTICE_WINDOW_MS;
+
+            // (a) Se repetiu a MESMA opção, ignora silenciosamente
+            if (actionId === st.firstActionId) return null;
+
+            // (b) Se mudou a opção, avisa 1x dentro da janela
+            if (withinWindow && !st.noticeSent) {
+              const previous = st.firstTitle || 'uma opção anterior';
+              const msg = `Eu vi que você estava falando comigo referente a “${previous}”.\n` +
+                          `Se quiser falar de “${newTitle}”, por favor selecione uma opção no menu abaixo.`;
+
+              // envia o texto informativo
               this._sendToWhatsApp({
                 messaging_product: 'whatsapp',
                 preview_url: false,
@@ -197,13 +203,21 @@ class WhatsApp {
                 text: { body: msg }
               });
 
+              // reenvia o ÚLTIMO MENU enviado a esse usuário (lista ou botões)
               const lastMenu = __lastMenuByUser.get(userId) || __getMenu(menuId);
               if (lastMenu) this._sendToWhatsApp(lastMenu);
+
+              // marca que já avisou; próximas trocas no mesmo menu NÃO geram nada
+              __menuState.set(menuId, { ...st, noticeSent: true });
+              return null;
             }
-            return null; // não encaminha pro ODA
+
+            // (c) Fora da janela OU já avisou → não envia nada
+            return null;
           }
         }
 
+        // Primeiro clique desse menu → envia ação limpa ao ODA
         return {
           userId,
           messagePayload: {
@@ -222,14 +236,24 @@ class WhatsApp {
 
         if (menuId) {
           const st = __menuState.get(menuId);
-          if (!st || !st.consumed) {
-            __menuState.set(menuId, { consumed: true, firstTitle: newTitle });
-          } else {
-            const previous = st.firstTitle || 'uma opção anterior';
-            const msg = `Eu vi que você estava falando comigo referente a “${previous}”.\n` +
-                        `Se quiser falar de “${newTitle}”, por favor selecione uma opção no menu abaixo.`;
 
-            if (__throttleOnce(__notifyThrottle, menuId, 4000)) {
+          if (!st) {
+            __menuState.set(menuId, {
+              firstActionId: actionId,
+              firstTitle: newTitle,
+              consumedAt: Date.now(),
+              noticeSent: false
+            });
+          } else {
+            const withinWindow = (Date.now() - st.consumedAt) <= NOTICE_WINDOW_MS;
+
+            if (actionId === st.firstActionId) return null;
+
+            if (withinWindow && !st.noticeSent) {
+              const previous = st.firstTitle || 'uma opção anterior';
+              const msg = `Eu vi que você estava falando comigo referente a “${previous}”.\n` +
+                          `Se quiser falar de “${newTitle}”, por favor selecione uma opção no menu abaixo.`;
+
               this._sendToWhatsApp({
                 messaging_product: 'whatsapp',
                 preview_url: false,
@@ -241,7 +265,11 @@ class WhatsApp {
 
               const lastMenu = __lastMenuByUser.get(userId) || __getMenu(menuId);
               if (lastMenu) this._sendToWhatsApp(lastMenu);
+
+              __menuState.set(menuId, { ...st, noticeSent: true });
+              return null;
             }
+
             return null;
           }
         }
@@ -533,9 +561,9 @@ class WhatsApp {
     }
 
     const wantUpload = String(process.env.WHATSAPP_UPLOAD_MEDIA || '').toLowerCase() === 'true';
-    const canUpload = typeof this.whatsAppSender._uploadToWhatsAppMedia === 'function';
+    theCanUpload = typeof this.whatsAppSender._uploadToWhatsAppMedia === 'function';
 
-    if (wantUpload && canUpload) {
+    if (wantUpload && theCanUpload) {
       try {
         const res = await axios.get(url, { responseType: 'arraybuffer' });
         const buffer = Buffer.from(res.data);
